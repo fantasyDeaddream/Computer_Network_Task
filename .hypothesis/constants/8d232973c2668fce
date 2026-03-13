@@ -1,0 +1,4 @@
+# file: D:\Computer_Network_Task\任务2\audio_decoder.py
+# hypothesis_version: 6.151.9
+
+['WAV数据不能为空', 'WAV数据必须是bytes类型', 'rb']

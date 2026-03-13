@@ -1,0 +1,4 @@
+# file: D:\Computer_Network_Task\任务2\audio_encoder.py
+# hypothesis_version: 6.151.9
+
+['wb', '音频数据不能为空', '音频数据必须是bytes类型']

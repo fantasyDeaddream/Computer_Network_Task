@@ -1,0 +1,4 @@
+# file: D:\Computer_Network_Task\任务2\audio_protocol.py
+# hypothesis_version: 6.151.9
+
+['audio', 'data', 'filename', 'length', 'type', 'utf-8', '文件名不能为空', '消息不能为空', '消息必须是字符串类型', '消息格式验证失败', '音频数据不能为空', '音频数据必须是bytes类型']

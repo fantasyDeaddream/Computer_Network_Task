@@ -1,0 +1,4 @@
+# file: D:\Computer_Network_Task\任务2\audio_config.py
+# hypothesis_version: 6.151.9
+
+[255, 1024, 8880, 16000, 'channels', 'chunk_size', 'format', 'localhost', 'max_duration', 'sample_rate', 'sample_width']
