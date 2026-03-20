@@ -171,6 +171,8 @@ class StreamServer:
             self._handle_call_reject(cid, payload)
         elif msg_type == "call_hangup":
             self._handle_call_hangup(cid, payload)
+        elif msg_type == "media_stop":
+            self._handle_media_stop(cid, payload)
 
     def _handle_login(self, cid: int, payload: dict) -> None:
         nickname = str(payload.get("nickname", "")).strip()
@@ -381,6 +383,28 @@ class StreamServer:
             target = str(payload.get("target", "")).strip() or info.in_call_with
 
         self._end_call(username, target)
+
+    def _handle_media_stop(self, cid: int, payload: dict) -> None:
+        with self._lock:
+            info = self._clients.get(cid)
+            if not info or not info.nickname:
+                return
+            source = info.nickname
+            target = str(payload.get("target", "")).strip() or info.in_call_with
+            target_cid = self._nickname_map.get(target) if target else None
+
+        if not target_cid:
+            return
+
+        msg = json.dumps(
+            {
+                "type": "media_stop",
+                "peer": source,
+            },
+            ensure_ascii=False,
+        )
+        self._send_by_cid(target_cid, msg)
+        print(f"[Server] Media stop forwarded: {source} -> {target}")
 
     def _handle_disconnect(self, cid: int) -> None:
         username = ""

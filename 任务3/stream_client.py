@@ -37,6 +37,7 @@ from stream_protocol import (
     encode_call_invite,
     encode_call_reject,
     encode_login,
+    encode_media_stop,
     encode_media_probe,
     encode_text,
 )
@@ -347,6 +348,7 @@ class StreamClient:
         )
 
     def stop_streaming(self) -> None:
+        was_sending = self._sending
         self._sending = False
         try:
             if self._in_stream:
@@ -355,6 +357,11 @@ class StreamClient:
         except Exception:
             pass
         self._in_stream = None
+        if was_sending and self._control_sock and self._in_call_with:
+            try:
+                self._send_control(encode_media_stop(self._in_call_with))
+            except Exception:
+                pass
         print("[Client] Stop audio capture")
 
     def _send_audio_loop(self) -> None:
@@ -591,6 +598,12 @@ class StreamClient:
             self._clear_media_session(reset_state=True)
             self._set_call_state(CallState.ENDED, "")
             threading.Timer(1.0, lambda: self._set_call_state(CallState.IDLE, "")).start()
+            return
+
+        if msg_type == "media_stop":
+            peer = str(payload.get("peer", "")).strip() or self._in_call_with
+            self._reset_jitter_buffer()
+            print(f"[Client] {peer or 'Peer'} stopped audio sending")
             return
 
         if msg_type == "text":

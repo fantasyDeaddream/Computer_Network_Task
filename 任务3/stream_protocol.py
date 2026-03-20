@@ -23,6 +23,7 @@ ControlMessageType = Literal[
     "call_busy",
     "call_not_found",
     "call_ready",
+    "media_stop",
 ]
 
 MediaPacketType = Literal["audio_frame", "media_probe"]
@@ -105,6 +106,10 @@ def encode_call_ready(
     return json.dumps(msg, ensure_ascii=False)
 
 
+def encode_media_stop(target: str) -> str:
+    return json.dumps({"type": "media_stop", "target": target}, ensure_ascii=False)
+
+
 def encode_audio_frame(
     stream_id: str,
     sequence: int,
@@ -160,6 +165,7 @@ def decode_message(raw: str) -> tuple[str, dict]:
         "call_busy",
         "call_not_found",
         "call_ready",
+        "media_stop",
     }
     if msg_type not in valid_types:
         raise ValueError(f"unknown control type: {msg_type}")
