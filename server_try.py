@@ -9,7 +9,7 @@ import os
 import sys
 import time
 
-HOST = '10.192.8.240'
+HOST = '10.192.60.12'
 PORT = 65432
 MAX_MSG = 100 * 1024 * 1024
 
