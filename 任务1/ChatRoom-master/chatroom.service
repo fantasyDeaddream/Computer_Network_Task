@@ -1,0 +1,36 @@
+# /etc/systemd/system/chatroom.service
+
+[Unit]
+# 服务的描述，会显示在 status 命令里
+Description=My Python TCP Server
+
+# 指定服务在网络准备好之后才启动，对于网络服务这是必须的
+After=network.target
+
+[Service]
+# 以哪个用户身份运行脚本，非常重要的安全实践，不要用 root
+User=watersail
+
+# 以哪个用户组身份运行
+Group=watersail
+
+# 设置工作目录，脚本里的相对路径都会基于这个目录
+WorkingDirectory=/home/watersail/cn/ChatRoom
+
+# 核心！定义如何启动你的服务
+# 这里必须使用绝对路径指向虚拟环境里的 Python 解释器和你的脚本
+ExecStart=/usr/bin/python3 /home/watersail/cn/ChatRoom/qser_start.py
+
+# 服务失败时的重启策略
+# on-failure: 只在异常退出时（退出码非0）重启
+# always: 无论如何都重启（比如脚本自己正常退出了也会被重启）
+# 对于服务器应用，推荐 on-failure 或 always
+Restart=on-failure
+
+# 重启前等待多少秒，防止在启动就失败的情况下疯狂重启耗尽资源
+RestartSec=5
+
+[Install]
+# 定义服务应该在哪个“目标”下启用。
+# multi-user.target 是标准的文本模式多用户环境，即“开机自启”
+WantedBy=multi-user.target
