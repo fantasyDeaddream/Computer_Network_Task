@@ -1,0 +1,14 @@
+{
+  "alice": {
+    "username": "alice"
+  },
+  "bob": {
+    "username": "bob"
+  },
+  "watersail": {
+    "username": "watersail"
+  },
+  "guest": {
+    "username": "guest"
+  }
+}
