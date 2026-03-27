@@ -546,7 +546,70 @@ class ChatRoomFrame(ttk.Frame):
         self._member_count_label.pack(side="right")
 
     def _on_invite(self):
-        target = simpledialog.askstring("邀请用户", "请输入要邀请的用户名:")
+        """弹出邀请对话框，支持从电话本下拉选择联系人（显示在线状态）"""
+        dialog = tk.Toplevel(self)
+        dialog.title("邀请用户")
+        dialog.geometry("350x200")
+        dialog.resizable(False, False)
+        dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="选择或输入要邀请的用户名:", font=("微软雅黑", 10)).pack(
+            padx=15, pady=(15, 5), anchor="w"
+        )
+
+        # 下拉框 + 手动输入
+        combo_var = tk.StringVar()
+        combo = ttk.Combobox(dialog, textvariable=combo_var, width=30)
+        combo.pack(padx=15, pady=5, fill="x")
+
+        # 图例
+        ttk.Label(
+            dialog, text="🟢 在线  ⚪ 离线", foreground="gray", font=("微软雅黑", 9)
+        ).pack(padx=15, anchor="w")
+
+        # 在后台加载联系人和在线状态
+        def load_contacts():
+            contacts = self._client.get_contacts()
+            online_users = self._client.get_online_users()
+            online_set = set(online_users)
+            display_list = []
+            for c in contacts:
+                prefix = "🟢 " if c in online_set else "⚪ "
+                display_list.append(f"{prefix}{c}")
+            dialog.after(0, lambda: combo.configure(values=display_list))
+
+        threading.Thread(target=load_contacts, daemon=True).start()
+
+        result = {"value": None}
+
+        def on_ok():
+            raw = combo_var.get().strip()
+            # 去掉在线状态前缀
+            for prefix in ("🟢 ", "⚪ "):
+                if raw.startswith(prefix):
+                    raw_name = raw[len(prefix) :]
+                    break
+            else:
+                raw_name = raw
+            if raw_name:
+                result["value"] = raw_name
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=15)
+        ttk.Button(btn_frame, text="邀请", command=on_ok).pack(side="left", padx=10)
+        ttk.Button(btn_frame, text="取消", command=on_cancel).pack(side="left", padx=10)
+
+        combo.focus_set()
+        combo.bind("<Return>", lambda e: on_ok())
+
+        dialog.wait_window()
+
+        target = result["value"]
         if not target:
             return
 
