@@ -6,6 +6,7 @@
 
 try:
     import pyaudio
+
     AUDIO_FORMAT = pyaudio.paInt16  # pyaudio格式：16位整数
 except ImportError:
     # 如果pyaudio未安装，使用占位符值
@@ -27,16 +28,16 @@ MAX_FILENAME_LENGTH = 255  # 文件名最大长度
 MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 最大音频大小：10MB
 
 # 网络参数
-DEFAULT_HOST = 'localhost'
+DEFAULT_HOST = "m.weaving.cloud"
 DEFAULT_PORT = 8880
-MESSAGE_DELIMITER = '\n'  # 消息分隔符
+MESSAGE_DELIMITER = "\n"  # 消息分隔符
 
 # 音频配置字典（用于方便传递参数）
 AUDIO_CONFIG = {
-    'sample_rate': SAMPLE_RATE,
-    'channels': CHANNELS,
-    'sample_width': SAMPLE_WIDTH,
-    'format': AUDIO_FORMAT,
-    'chunk_size': CHUNK_SIZE,
-    'max_duration': MAX_DURATION
+    "sample_rate": SAMPLE_RATE,
+    "channels": CHANNELS,
+    "sample_width": SAMPLE_WIDTH,
+    "format": AUDIO_FORMAT,
+    "chunk_size": CHUNK_SIZE,
+    "max_duration": MAX_DURATION,
 }
