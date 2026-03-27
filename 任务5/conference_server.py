@@ -162,6 +162,7 @@ class ConferenceServer:
             "contact_update": lambda: self._handle_contact_op(cid, payload, "update"),
             "contact_list": lambda: self._handle_contact_op(cid, payload, "list"),
             "contact_search": lambda: self._handle_contact_op(cid, payload, "search"),
+            "online_query": lambda: self._handle_online_query(cid),
             "room_create": lambda: self._handle_room_create(cid),
             "room_invite": lambda: self._handle_room_invite(cid, payload),
             "room_join": lambda: self._handle_room_join(cid, payload),
@@ -251,6 +252,20 @@ class ConferenceServer:
             self._send_by_cid(
                 cid, encode_response(True, "搜索成功", {"contacts": contacts})
             )
+
+    # ---- online query ----
+
+    def _handle_online_query(self, cid):
+        """返回当前所有在线用户列表"""
+        with self._lock:
+            info = self._clients.get(cid)
+            if not info or not info.username:
+                self._send_by_cid(cid, encode_response(False, "未登录"))
+                return
+            online_users = list(self._username_map.keys())
+        self._send_by_cid(
+            cid, encode_response(True, "查询成功", {"online_users": online_users})
+        )
 
     # ---- room ----
 

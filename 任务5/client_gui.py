@@ -106,13 +106,19 @@ class LoginFrame(ttk.Frame):
 
 # ============================================================
 # ContactFrame - 复用任务4的联系人界面（撤销双击呼叫功能）
+# 新增：显示联系人在线/离线状态
 # ============================================================
 class ContactFrame(ttk.Frame):
+
+    # 在线/离线状态前缀
+    _ONLINE_PREFIX = "🟢 "
+    _OFFLINE_PREFIX = "⚪ "
 
     def __init__(self, parent, client: ConferenceClient, username: str):
         super().__init__(parent)
         self._client = client
         self._username = username
+        self._raw_contacts: list[str] = []  # 存储不带状态前缀的原始联系人名
         self._build_ui()
         self._refresh_contacts()
 
@@ -151,6 +157,16 @@ class ContactFrame(ttk.Frame):
             side="left", padx=2
         )
 
+        # 图例说明
+        legend_frame = ttk.Frame(self)
+        legend_frame.pack(fill="x", padx=10, pady=(0, 2))
+        ttk.Label(
+            legend_frame,
+            text="🟢 在线  ⚪ 离线",
+            foreground="gray",
+            font=("微软雅黑", 9),
+        ).pack(side="left")
+
         list_box = ttk.Labelframe(self, text="联系人列表", padding=5)
         list_box.pack(fill="both", expand=True, padx=10, pady=5)
         self.contact_listbox = tk.Listbox(list_box, height=15)
@@ -162,11 +178,38 @@ class ContactFrame(ttk.Frame):
         self.contact_listbox.config(yscrollcommand=scrollbar.set)
         # 注意：不绑定双击呼叫事件（任务5撤销此功能）
 
-    def _refresh_contacts(self):
-        contacts = self._client.get_contacts()
+    def _get_raw_name(self, display_text: str) -> str:
+        """从列表显示文本中提取原始用户名（去掉在线状态前缀）"""
+        for prefix in (self._ONLINE_PREFIX, self._OFFLINE_PREFIX):
+            if display_text.startswith(prefix):
+                return display_text[len(prefix) :]
+        return display_text
+
+    def _display_contacts(self, contacts: list[str]) -> None:
+        """在列表中显示联系人并标注在线状态"""
+        self._raw_contacts = list(contacts)
+
+        # 在后台线程中查询在线用户，避免阻塞UI
+        def query_and_display():
+            online_users = self._client.get_online_users()
+            online_set = set(online_users)
+            self.after(0, lambda: self._fill_listbox(contacts, online_set))
+
+        threading.Thread(target=query_and_display, daemon=True).start()
+
+    def _fill_listbox(self, contacts: list[str], online_set: set) -> None:
+        """用在线状态信息填充联系人列表"""
         self.contact_listbox.delete(0, tk.END)
         for c in contacts:
-            self.contact_listbox.insert(tk.END, c)
+            if c in online_set:
+                display = f"{self._ONLINE_PREFIX}{c}"
+            else:
+                display = f"{self._OFFLINE_PREFIX}{c}"
+            self.contact_listbox.insert(tk.END, display)
+
+    def _refresh_contacts(self):
+        contacts = self._client.get_contacts()
+        self._display_contacts(contacts)
 
     def _on_add(self):
         name = simpledialog.askstring("添加联系人", "请输入联系人用户名:")
@@ -184,7 +227,8 @@ class ContactFrame(ttk.Frame):
         if not sel:
             messagebox.showwarning("未选择", "请先选择一个联系人")
             return
-        name = self.contact_listbox.get(sel[0])
+        raw_display = self.contact_listbox.get(sel[0])
+        name = self._get_raw_name(raw_display)
         if messagebox.askyesno("确认", f"确定要删除联系人 {name} 吗?"):
             ok, msg = self._client.delete_contact(name)
             if ok:
@@ -198,7 +242,8 @@ class ContactFrame(ttk.Frame):
         if not sel:
             messagebox.showwarning("未选择", "请先选择一个联系人")
             return
-        old = self.contact_listbox.get(sel[0])
+        raw_display = self.contact_listbox.get(sel[0])
+        old = self._get_raw_name(raw_display)
         new = simpledialog.askstring(
             "修改联系人", "请输入新的用户名:", initialvalue=old
         )
@@ -217,9 +262,7 @@ class ContactFrame(ttk.Frame):
             self._refresh_contacts()
             return
         contacts = self._client.search_contacts(kw)
-        self.contact_listbox.delete(0, tk.END)
-        for c in contacts:
-            self.contact_listbox.insert(tk.END, c)
+        self._display_contacts(contacts)
 
 
 # ============================================================

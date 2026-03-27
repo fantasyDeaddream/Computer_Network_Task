@@ -48,6 +48,7 @@ from conference_protocol import (
     encode_contact_update,
     encode_contact_list,
     encode_contact_search,
+    encode_online_query,
     encode_room_create,
     encode_room_invite,
     encode_room_join,
@@ -268,6 +269,13 @@ class ConferenceClient:
         )
         if ok:
             return data.get("contacts", [])
+        return []
+
+    def get_online_users(self) -> List[str]:
+        """查询当前在线的用户列表"""
+        ok, msg, data = self._request_response(encode_online_query(self._username))
+        if ok:
+            return data.get("online_users", [])
         return []
 
     # ---- room ----

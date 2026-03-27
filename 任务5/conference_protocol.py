@@ -14,6 +14,7 @@
 - room_dismissed_notify: 通知聊天室已被解散
 - room_member_update: 聊天室成员变更通知
 - room_audio_chunk: 聊天室音频数据块
+- online_query: 查询在线用户列表
 """
 
 import base64
@@ -48,6 +49,7 @@ MessageType = Literal[
     "room_dismissed_notify",
     "room_member_update",
     "room_audio_chunk",
+    "online_query",
 ]
 
 MESSAGE_DELIMITER = "\n"
@@ -139,6 +141,15 @@ def encode_room_audio_chunk(room_id: str, sender: str, raw: bytes) -> str:
     return json.dumps(msg)
 
 
+# ========== 在线状态查询 ==========
+
+
+def encode_online_query(username: str) -> str:
+    """编码查询在线用户列表请求"""
+    msg = {"type": "online_query", "username": username}
+    return json.dumps(msg, ensure_ascii=False)
+
+
 # ========== 复用任务4的编码函数 ==========
 
 
@@ -217,6 +228,7 @@ VALID_TYPES = (
     "room_dismissed_notify",
     "room_member_update",
     "room_audio_chunk",
+    "online_query",
 )
 
 
