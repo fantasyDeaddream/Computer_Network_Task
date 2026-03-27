@@ -10,5 +10,8 @@
   },
   "guest": {
     "username": "guest"
+  },
+  "mimi": {
+    "username": "mimi"
   }
 }
