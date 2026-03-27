@@ -87,12 +87,17 @@ class ConferenceClient:
         self._room_state = RoomState.IDLE
         self._is_creator = False
         self._my_position = -1
+        self._audio_protocol = "tcp"  # 当前聊天室的音频协议
 
         self._p = pyaudio.PyAudio() if pyaudio else None
         self._out_stream = None
         self._in_stream = None
         self._is_streaming = False
         self._recv_thread_started = False
+
+        # UDP音频相关
+        self._udp_sock: Optional[socket.socket] = None
+        self._udp_server_addr: Optional[tuple] = None  # (host, udp_port)
 
         self._response_queue: queue.Queue = queue.Queue()
 
@@ -127,6 +132,10 @@ class ConferenceClient:
     @property
     def my_position(self):
         return self._my_position
+
+    @property
+    def audio_protocol(self):
+        return self._audio_protocol
 
     # ---- connection ----
 
@@ -208,6 +217,7 @@ class ConferenceClient:
         self._is_streaming = False
         self._recv_thread_started = False
         self._stop_audio()
+        self._teardown_udp()
         try:
             if self._out_stream:
                 self._out_stream.stop_stream()
@@ -223,6 +233,7 @@ class ConferenceClient:
         self._sock = None
         self._room_id = ""
         self._room_state = RoomState.IDLE
+        self._audio_protocol = "tcp"
 
     # ---- contacts ----
 
@@ -280,13 +291,24 @@ class ConferenceClient:
 
     # ---- room ----
 
-    def create_room(self):
-        ok, msg, data = self._request_response(encode_room_create(self._username))
+    def create_room(self, audio_protocol: str = "tcp"):
+        """创建聊天室
+
+        Args:
+            audio_protocol: 音频传输协议，"tcp" 或 "udp"
+        """
+        ok, msg, data = self._request_response(
+            encode_room_create(self._username, audio_protocol)
+        )
         if ok:
             self._room_id = data.get("room_id", "")
             self._my_position = data.get("position", -1)
             self._is_creator = True
             self._room_state = RoomState.IN_ROOM
+            self._audio_protocol = data.get("audio_protocol", "tcp")
+            if self._audio_protocol == "udp":
+                udp_port = data.get("udp_port", 0)
+                self._setup_udp(udp_port)
             self._start_audio()
         return ok, msg, data
 
@@ -307,6 +329,10 @@ class ConferenceClient:
             self._my_position = data.get("position", -1)
             self._is_creator = data.get("creator", "") == self._username
             self._room_state = RoomState.IN_ROOM
+            self._audio_protocol = data.get("audio_protocol", "tcp")
+            if self._audio_protocol == "udp":
+                udp_port = data.get("udp_port", 0)
+                self._setup_udp(udp_port)
             self._start_audio()
         return ok, msg, data
 
@@ -316,10 +342,12 @@ class ConferenceClient:
         rid = self._room_id
         self._send_raw(encode_room_leave(rid, self._username))
         self._stop_audio()
+        self._teardown_udp()
         self._room_id = ""
         self._room_state = RoomState.IDLE
         self._is_creator = False
         self._my_position = -1
+        self._audio_protocol = "tcp"
 
     def dismiss_room(self):
         if not self._room_id:
@@ -327,10 +355,39 @@ class ConferenceClient:
         rid = self._room_id
         self._send_raw(encode_room_dismiss(rid, self._username))
         self._stop_audio()
+        self._teardown_udp()
         self._room_id = ""
         self._room_state = RoomState.IDLE
         self._is_creator = False
         self._my_position = -1
+        self._audio_protocol = "tcp"
+
+    # ---- UDP ----
+
+    def _setup_udp(self, server_udp_port: int) -> None:
+        """建立UDP socket并记录服务器UDP地址"""
+        try:
+            self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._udp_sock.bind(("", 0))  # 绑定随机本地端口
+            self._udp_server_addr = (self._host, server_udp_port)
+            print(
+                f"[Client] UDP setup: server={self._udp_server_addr}, "
+                f"local={self._udp_sock.getsockname()}"
+            )
+        except Exception as e:
+            print(f"[Client] UDP setup failed: {e}")
+            self._udp_sock = None
+            self._udp_server_addr = None
+
+    def _teardown_udp(self) -> None:
+        """关闭UDP socket"""
+        if self._udp_sock:
+            try:
+                self._udp_sock.close()
+            except Exception:
+                pass
+            self._udp_sock = None
+        self._udp_server_addr = None
 
     # ---- audio ----
 
@@ -352,6 +409,9 @@ class ConferenceClient:
             return
         self._is_streaming = True
         threading.Thread(target=self._send_audio_loop, daemon=True).start()
+        # UDP模式下启动UDP接收线程
+        if self._audio_protocol == "udp" and self._udp_sock:
+            threading.Thread(target=self._udp_recv_audio_loop, daemon=True).start()
 
     def _stop_audio(self):
         self._is_streaming = False
@@ -365,19 +425,54 @@ class ConferenceClient:
         self._in_stream = None
 
     def _send_audio_loop(self):
-        while self._is_streaming and self._sock and self._room_id:
+        while self._is_streaming and self._room_id:
             try:
                 data = self._in_stream.read(CHUNK_SIZE, exception_on_overflow=False)
             except Exception:
                 break
             if not data:
                 continue
-            try:
-                msg = encode_room_audio_chunk(self._room_id, self._username, data)
-                self._sock.sendall((msg + MESSAGE_DELIMITER).encode("utf-8"))
-            except Exception:
-                break
+
+            if (
+                self._audio_protocol == "udp"
+                and self._udp_sock
+                and self._udp_server_addr
+            ):
+                # UDP模式：通过UDP发送音频
+                try:
+                    # 前32字节为用户名，其余为音频数据
+                    username_bytes = self._username.encode("utf-8")[:32].ljust(
+                        32, b"\x00"
+                    )
+                    self._udp_sock.sendto(username_bytes + data, self._udp_server_addr)
+                except Exception:
+                    break
+            else:
+                # TCP模式：通过TCP发送音频
+                try:
+                    if not self._sock:
+                        break
+                    msg = encode_room_audio_chunk(self._room_id, self._username, data)
+                    self._sock.sendall((msg + MESSAGE_DELIMITER).encode("utf-8"))
+                except Exception:
+                    break
             time.sleep(0.001)
+
+    def _udp_recv_audio_loop(self):
+        """UDP模式下接收音频数据并播放"""
+        while self._is_streaming and self._udp_sock:
+            try:
+                self._udp_sock.settimeout(1.0)
+                data, _ = self._udp_sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if data and self._out_stream:
+                try:
+                    self._out_stream.write(data, exception_on_underflow=False)
+                except Exception:
+                    pass
 
     # ---- network ----
 
@@ -440,10 +535,12 @@ class ConferenceClient:
         elif mtype == "room_dismissed_notify":
             room_id = payload.get("room_id", "")
             self._stop_audio()
+            self._teardown_udp()
             self._room_id = ""
             self._room_state = RoomState.IDLE
             self._is_creator = False
             self._my_position = -1
+            self._audio_protocol = "tcp"
             if self._on_room_dismissed:
                 self._on_room_dismissed(room_id)
 

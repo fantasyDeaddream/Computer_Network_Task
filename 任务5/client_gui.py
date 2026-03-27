@@ -342,10 +342,58 @@ class TelephoneFrame(ttk.Frame):
         self.hint_text.config(state="disabled")
 
     def _on_create_room(self):
+        """弹出对话框让用户选择音频传输协议，然后创建聊天室"""
+        dialog = tk.Toplevel(self)
+        dialog.title("创建聊天室")
+        dialog.geometry("320x180")
+        dialog.resizable(False, False)
+        dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="请选择音频传输协议:", font=("微软雅黑", 11)).pack(
+            padx=20, pady=(20, 10), anchor="w"
+        )
+
+        protocol_var = tk.StringVar(value="tcp")
+        radio_frame = ttk.Frame(dialog)
+        radio_frame.pack(padx=20, fill="x")
+        ttk.Radiobutton(
+            radio_frame,
+            text="TCP（可靠传输，延迟较高）",
+            variable=protocol_var,
+            value="tcp",
+        ).pack(anchor="w", pady=2)
+        ttk.Radiobutton(
+            radio_frame,
+            text="UDP（低延迟，可能丢包）",
+            variable=protocol_var,
+            value="udp",
+        ).pack(anchor="w", pady=2)
+
+        result = {"protocol": None}
+
+        def on_ok():
+            result["protocol"] = protocol_var.get()
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=15)
+        ttk.Button(btn_frame, text="创建", command=on_ok).pack(side="left", padx=10)
+        ttk.Button(btn_frame, text="取消", command=on_cancel).pack(side="left", padx=10)
+
+        dialog.wait_window()
+
+        if result["protocol"] is None:
+            return
+
         self.btn_create.config(state="disabled")
+        audio_protocol = result["protocol"]
 
         def do_create():
-            ok, msg, data = self._client.create_room()
+            ok, msg, data = self._client.create_room(audio_protocol=audio_protocol)
             self.after(0, lambda: self._handle_create_result(ok, msg, data))
 
         threading.Thread(target=do_create, daemon=True).start()
@@ -460,7 +508,10 @@ class ChatRoomFrame(ttk.Frame):
         ).pack(side="left")
 
         role_text = "创建者" if self._client.is_creator else "成员"
-        ttk.Label(top, text=f"  ({role_text})", foreground="gray").pack(side="left")
+        proto_text = self._client.audio_protocol.upper()
+        ttk.Label(
+            top, text=f"  ({role_text} | 音频: {proto_text})", foreground="gray"
+        ).pack(side="left")
 
         # 操作按钮
         btn_frame = ttk.Frame(top)
@@ -537,8 +588,9 @@ class ChatRoomFrame(ttk.Frame):
         status_bar = ttk.Frame(self)
         status_bar.pack(fill="x", padx=10, pady=5)
 
+        proto_label = self._client.audio_protocol.upper()
         self._status_label = ttk.Label(
-            status_bar, text="语音通话中...", foreground="green"
+            status_bar, text=f"语音通话中... ({proto_label})", foreground="green"
         )
         self._status_label.pack(side="left")
 

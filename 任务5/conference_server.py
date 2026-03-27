@@ -44,14 +44,18 @@ class ClientInfo:
     addr: Tuple[str, int]
     username: str = ""
     room_id: str = ""
+    udp_addr: Optional[Tuple[str, int]] = None  # 客户端的UDP地址（用于UDP音频转发）
 
 
 @dataclass
 class ChatRoom:
     room_id: str
     creator: str
+    audio_protocol: str = "tcp"  # "tcp" 或 "udp"
     members: Dict[str, int] = field(default_factory=dict)
     invited: Set[str] = field(default_factory=set)
+    udp_port: int = 0  # UDP模式下服务器分配的UDP端口
+    _udp_sock: Optional[socket.socket] = field(default=None, repr=False)
 
     def get_available_positions(self) -> List[int]:
         used = set(self.members.values())
@@ -163,7 +167,7 @@ class ConferenceServer:
             "contact_list": lambda: self._handle_contact_op(cid, payload, "list"),
             "contact_search": lambda: self._handle_contact_op(cid, payload, "search"),
             "online_query": lambda: self._handle_online_query(cid),
-            "room_create": lambda: self._handle_room_create(cid),
+            "room_create": lambda: self._handle_room_create(cid, payload),
             "room_invite": lambda: self._handle_room_invite(cid, payload),
             "room_join": lambda: self._handle_room_join(cid, payload),
             "room_leave": lambda: self._handle_room_leave(cid, payload),
@@ -269,7 +273,13 @@ class ConferenceServer:
 
     # ---- room ----
 
-    def _handle_room_create(self, cid):
+    def _handle_room_create(self, cid, payload=None):
+        if payload is None:
+            payload = {}
+        audio_protocol = payload.get("audio_protocol", "tcp")
+        if audio_protocol not in ("tcp", "udp"):
+            audio_protocol = "tcp"
+
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
@@ -280,14 +290,32 @@ class ConferenceServer:
                 return
             creator = info.username
             rid = uuid.uuid4().hex[:8]
-            room = ChatRoom(room_id=rid, creator=creator)
+            room = ChatRoom(room_id=rid, creator=creator, audio_protocol=audio_protocol)
             pos = room.assign_position(creator)
+
+            # UDP模式：为聊天室创建UDP socket
+            if audio_protocol == "udp":
+                udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                udp_sock.bind((self._host, 0))  # 绑定随机端口
+                udp_port = udp_sock.getsockname()[1]
+                room.udp_port = udp_port
+                room._udp_sock = udp_sock
+                # 启动UDP接收转发线程
+                threading.Thread(
+                    target=self._udp_recv_loop, args=(rid,), daemon=True
+                ).start()
+                print(f"[Server] Room {rid} UDP port: {udp_port}")
+
             self._rooms[rid] = room
             info.room_id = rid
-        print(f"[Server] Room {rid} created by {creator}")
+
+        resp_data = {"room_id": rid, "position": pos, "audio_protocol": audio_protocol}
+        if audio_protocol == "udp":
+            resp_data["udp_port"] = room.udp_port
+        print(f"[Server] Room {rid} created by {creator} (audio: {audio_protocol})")
         self._send_by_cid(
             cid,
-            encode_response(True, "聊天室创建成功", {"room_id": rid, "position": pos}),
+            encode_response(True, "聊天室创建成功", resp_data),
         )
         self._broadcast_member_update(rid)
 
@@ -350,18 +378,18 @@ class ConferenceServer:
             pos = room.assign_position(uname)
             room.invited.discard(uname)
             info.room_id = rid
+            join_data = {
+                "room_id": rid,
+                "position": pos,
+                "creator": room.creator,
+                "audio_protocol": room.audio_protocol,
+            }
+            if room.audio_protocol == "udp":
+                join_data["udp_port"] = room.udp_port
         print(f"[Server] {uname} joined room {rid} at pos {pos}")
         self._send_by_cid(
             cid,
-            encode_response(
-                True,
-                "加入聊天室成功",
-                {
-                    "room_id": rid,
-                    "position": pos,
-                    "creator": room.creator,
-                },
-            ),
+            encode_response(True, "加入聊天室成功", join_data),
         )
         self._broadcast_member_update(rid)
 
@@ -398,7 +426,9 @@ class ConferenceServer:
                     mi = self._clients.get(mc)
                     if mi:
                         mi.room_id = ""
+                        mi.udp_addr = None
                     self._send_by_cid(mc, dismiss_msg)
+            self._close_room_udp(room)
             del self._rooms[rid]
         print(f"[Server] Room {rid} dismissed by {uname}")
 
@@ -415,7 +445,9 @@ class ConferenceServer:
                         mi = self._clients.get(mc)
                         if mi:
                             mi.room_id = ""
+                            mi.udp_addr = None
                         self._send_by_cid(mc, dm)
+                self._close_room_udp(room)
                 del self._rooms[room_id]
                 print(f"[Server] Room {room_id} dismissed (creator left)")
                 return
@@ -425,6 +457,7 @@ class ConferenceServer:
                 ui = self._clients.get(uc)
                 if ui:
                     ui.room_id = ""
+                    ui.udp_addr = None
         print(f"[Server] {username} left room {room_id}")
         self._broadcast_member_update(room_id)
 
@@ -441,6 +474,7 @@ class ConferenceServer:
                     self._send_by_cid(self._username_map[m], msg)
 
     def _forward_room_audio(self, cid, raw):
+        """TCP模式下的音频转发"""
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.room_id:
@@ -454,6 +488,71 @@ class ConferenceServer:
                     continue
                 if m in self._username_map:
                     self._send_by_cid(self._username_map[m], raw)
+
+    def _udp_recv_loop(self, room_id: str) -> None:
+        """UDP模式下的音频接收和转发循环
+
+        每个UDP聊天室有一个独立的UDP socket。
+        客户端发送的UDP数据包格式：前32字节为用户名（UTF-8，右侧补零），其余为音频数据。
+        服务器收到后转发给同一聊天室的其他成员。
+        """
+        while self._running:
+            with self._lock:
+                room = self._rooms.get(room_id)
+                if not room or not room._udp_sock:
+                    break
+                udp_sock = room._udp_sock
+
+            try:
+                udp_sock.settimeout(1.0)
+                data, addr = udp_sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            if len(data) < 32:
+                continue
+
+            # 解析发送者用户名（前32字节）
+            sender = data[:32].rstrip(b"\x00").decode("utf-8", errors="ignore")
+            audio_data = data[32:]
+
+            with self._lock:
+                room = self._rooms.get(room_id)
+                if not room or not room._udp_sock:
+                    break
+
+                # 记录发送者的UDP地址
+                if sender in self._username_map:
+                    scid = self._username_map[sender]
+                    sinfo = self._clients.get(scid)
+                    if sinfo:
+                        sinfo.udp_addr = addr
+
+                # 转发给其他成员
+                for m in list(room.members.keys()):
+                    if m == sender:
+                        continue
+                    if m in self._username_map:
+                        mcid = self._username_map[m]
+                        minfo = self._clients.get(mcid)
+                        if minfo and minfo.udp_addr:
+                            try:
+                                udp_sock.sendto(audio_data, minfo.udp_addr)
+                            except Exception:
+                                pass
+
+        print(f"[Server] UDP recv loop for room {room_id} stopped")
+
+    def _close_room_udp(self, room: ChatRoom) -> None:
+        """关闭聊天室的UDP socket"""
+        if room._udp_sock:
+            try:
+                room._udp_sock.close()
+            except Exception:
+                pass
+            room._udp_sock = None
 
     # ---- network ----
 
