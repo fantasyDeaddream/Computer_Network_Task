@@ -1,0 +1,4 @@
+# file: D:\Computer_Network_Task\任务2\qser.py
+# hypothesis_version: 6.151.9
+
+[b'\n', 1024, 4096, '%Y-%m-%d %H:%M:%S', '0.0.0.0', 'ERROR', 'INFO', 'System', 'WARNING', '__main__', 'audio', 'broadcast', 'id', 'login', 'logout', 'message', 'nickname', 'sender_id', 'sender_nickname', 'type', 'utf-8', '服务器已关闭', '服务器收到中断信号，正在关闭...']
