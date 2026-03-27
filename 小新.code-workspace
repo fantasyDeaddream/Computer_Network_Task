@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "computer-networking",
+			"path": "../../../computer-networking"
+		}
+	],
+	"settings": {}
+}
