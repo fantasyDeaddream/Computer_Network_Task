@@ -1,16 +1,16 @@
 """
 Task 3 server:
-- TCP for signaling and text
-- UDP for media relay when peers are not in the same subnet
+- TCP for signaling and roster updates
+- UDP for relay fallback while direct P2P is negotiated
 """
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import socket
 import threading
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import sys
@@ -23,7 +23,12 @@ from stream_protocol import (
     encode_call_ready,
     encode_response,
     encode_text,
+    encode_transport_update,
+    encode_user_list,
 )
+
+
+NEGOTIATION_TIMEOUT_SEC = 1.6
 
 
 def _ensure_task2_on_path() -> None:
@@ -45,11 +50,21 @@ class ClientInfo:
     nickname: str = ""
     media_port: int = 0
     local_ip: str = ""
-    subnet_prefix: int = 24
     pending_peer: str = ""
     in_call_with: str = ""
     call_mode: str = ""
+    call_id: str = ""
     udp_observed_addr: Optional[Tuple[str, int]] = None
+
+
+@dataclass
+class CallSession:
+    call_id: str
+    caller: str
+    callee: str
+    direct_seen: set[str] = field(default_factory=set)
+    final_mode: str = ""
+    timer: Optional[threading.Timer] = None
 
 
 class StreamServer:
@@ -66,6 +81,7 @@ class StreamServer:
 
         self._clients: Dict[int, ClientInfo] = {}
         self._nickname_map: Dict[str, int] = {}
+        self._sessions: Dict[str, CallSession] = {}
         self._lock = threading.RLock()
         self._running = False
         self._udp_thread: Optional[threading.Thread] = None
@@ -110,6 +126,11 @@ class StreamServer:
 
     def _cleanup(self) -> None:
         with self._lock:
+            for session in list(self._sessions.values()):
+                if session.timer:
+                    session.timer.cancel()
+            self._sessions.clear()
+
             for info in list(self._clients.values()):
                 try:
                     info.conn.close()
@@ -171,6 +192,8 @@ class StreamServer:
             self._handle_call_reject(cid, payload)
         elif msg_type == "call_hangup":
             self._handle_call_hangup(cid, payload)
+        elif msg_type == "direct_path_seen":
+            self._handle_direct_path_seen(cid, payload)
         elif msg_type == "media_stop":
             self._handle_media_stop(cid, payload)
 
@@ -178,7 +201,6 @@ class StreamServer:
         nickname = str(payload.get("nickname", "")).strip()
         media_port = int(payload.get("media_port", 0) or 0)
         local_ip = str(payload.get("local_ip", "")).strip()
-        subnet_prefix = int(payload.get("subnet_prefix", 24) or 24)
 
         if not nickname:
             self._send_by_cid(cid, encode_response(False, "Nickname is required"))
@@ -199,9 +221,9 @@ class StreamServer:
             info.nickname = nickname
             info.media_port = media_port
             info.local_ip = local_ip or info.addr[0]
-            info.subnet_prefix = subnet_prefix
             info.udp_observed_addr = (info.addr[0], media_port)
             self._nickname_map[nickname] = cid
+            users = sorted(self._nickname_map.keys())
 
         print(
             "[Server] Login:",
@@ -210,13 +232,16 @@ class StreamServer:
                     "nickname": nickname,
                     "tcp_addr": self._clients[cid].addr,
                     "local_ip": local_ip or self._clients[cid].addr[0],
-                    "subnet_prefix": subnet_prefix,
                     "media_port": media_port,
                 },
                 ensure_ascii=False,
             ),
         )
-        self._send_by_cid(cid, encode_response(True, "Login success"))
+        self._send_by_cid(
+            cid,
+            encode_response(True, "Login success", {"users": users}),
+        )
+        self._broadcast_user_list()
 
     def _handle_text(self, cid: int, payload: dict) -> None:
         with self._lock:
@@ -276,10 +301,7 @@ class StreamServer:
             caller_info.pending_peer = target
             target_info.pending_peer = caller
 
-        invite = json.dumps(
-            {"type": "call_invite", "caller": caller},
-            ensure_ascii=False,
-        )
+        invite = json.dumps({"type": "call_invite", "caller": caller}, ensure_ascii=False)
         self._send_by_cid(target_cid, invite)
         print(f"[Server] Call invite: {caller} -> {target}")
 
@@ -293,58 +315,53 @@ class StreamServer:
             if not callee_info or not callee_info.nickname:
                 return
             callee = callee_info.nickname
+
             caller_cid = self._nickname_map.get(caller)
             caller_info = self._clients.get(caller_cid) if caller_cid else None
-
             if not caller_info:
                 self._send_by_cid(cid, encode_call_not_found(caller))
                 return
+
             if callee_info.pending_peer != caller or caller_info.pending_peer != callee:
                 self._send_by_cid(cid, encode_response(False, "No matching pending call"))
                 return
 
-            mode, detail = self._decide_call_mode(caller_info, callee_info)
+            call_id = uuid.uuid4().hex
+            session = CallSession(call_id=call_id, caller=caller, callee=callee)
+            self._sessions[call_id] = session
+
             caller_info.pending_peer = ""
             callee_info.pending_peer = ""
             caller_info.in_call_with = callee
             callee_info.in_call_with = caller
-            caller_info.call_mode = mode
-            callee_info.call_mode = mode
+            caller_info.call_mode = "negotiating"
+            callee_info.call_mode = "negotiating"
+            caller_info.call_id = call_id
+            callee_info.call_id = call_id
 
-            if mode == "p2p":
-                caller_ready = encode_call_ready(
-                    peer=callee,
-                    mode=mode,
-                    peer_ip=callee_info.local_ip,
-                    peer_port=callee_info.media_port,
-                    relay_port=self._port,
-                    detail=detail,
-                )
-                callee_ready = encode_call_ready(
-                    peer=caller,
-                    mode=mode,
-                    peer_ip=caller_info.local_ip,
-                    peer_port=caller_info.media_port,
-                    relay_port=self._port,
-                    detail=detail,
-                )
-            else:
-                caller_ready = encode_call_ready(
-                    peer=callee,
-                    mode=mode,
-                    relay_port=self._port,
-                    detail=detail,
-                )
-                callee_ready = encode_call_ready(
-                    peer=caller,
-                    mode=mode,
-                    relay_port=self._port,
-                    detail=detail,
-                )
+            caller_ready = encode_call_ready(
+                call_id=call_id,
+                peer=callee,
+                mode="negotiating",
+                peer_ip=callee_info.local_ip,
+                peer_port=callee_info.media_port,
+                relay_port=self._port,
+                detail="Trying direct UDP first; will fall back to relay if negotiation fails.",
+            )
+            callee_ready = encode_call_ready(
+                call_id=call_id,
+                peer=caller,
+                mode="negotiating",
+                peer_ip=caller_info.local_ip,
+                peer_port=caller_info.media_port,
+                relay_port=self._port,
+                detail="Trying direct UDP first; will fall back to relay if negotiation fails.",
+            )
 
         self._send_by_cid(caller_cid, caller_ready)
         self._send_by_cid(cid, callee_ready)
-        print(f"[Server] Call established: {caller} <-> {callee} via {mode.upper()} ({detail})")
+        self._arm_negotiation_timer(call_id)
+        print(f"[Server] Call established: {caller} <-> {callee}; starting P2P negotiation")
 
     def _handle_call_reject(self, cid: int, payload: dict) -> None:
         caller = str(payload.get("caller", "")).strip()
@@ -364,11 +381,7 @@ class StreamServer:
 
         if caller_cid:
             reject_msg = json.dumps(
-                {
-                    "type": "call_reject",
-                    "caller": callee,
-                    "reason": reason,
-                },
+                {"type": "call_reject", "caller": callee, "reason": reason},
                 ensure_ascii=False,
             )
             self._send_by_cid(caller_cid, reject_msg)
@@ -384,6 +397,31 @@ class StreamServer:
 
         self._end_call(username, target)
 
+    def _handle_direct_path_seen(self, cid: int, payload: dict) -> None:
+        call_id = str(payload.get("call_id", "")).strip()
+        if not call_id:
+            return
+
+        should_finalize = False
+        with self._lock:
+            info = self._clients.get(cid)
+            session = self._sessions.get(call_id)
+            if not info or not info.nickname or not session or session.final_mode:
+                return
+            if info.nickname not in (session.caller, session.callee):
+                return
+
+            if info.nickname not in session.direct_seen:
+                session.direct_seen.add(info.nickname)
+                print(
+                    f"[Server] Direct UDP path seen for call {call_id}: "
+                    f"{sorted(session.direct_seen)}"
+                )
+            should_finalize = len(session.direct_seen) == 2
+
+        if should_finalize:
+            self._finalize_session(call_id, mode="p2p", reason="both peers confirmed direct UDP")
+
     def _handle_media_stop(self, cid: int, payload: dict) -> None:
         with self._lock:
             info = self._clients.get(cid)
@@ -396,19 +434,14 @@ class StreamServer:
         if not target_cid:
             return
 
-        msg = json.dumps(
-            {
-                "type": "media_stop",
-                "peer": source,
-            },
-            ensure_ascii=False,
-        )
+        msg = json.dumps({"type": "media_stop", "peer": source}, ensure_ascii=False)
         self._send_by_cid(target_cid, msg)
         print(f"[Server] Media stop forwarded: {source} -> {target}")
 
     def _handle_disconnect(self, cid: int) -> None:
         username = ""
         target = ""
+        call_id = ""
 
         with self._lock:
             info = self._clients.pop(cid, None)
@@ -416,6 +449,7 @@ class StreamServer:
                 return
             username = info.nickname
             target = info.in_call_with or info.pending_peer
+            call_id = info.call_id
             if username:
                 self._nickname_map.pop(username, None)
 
@@ -425,6 +459,8 @@ class StreamServer:
                 if peer_info and peer_info.pending_peer == username:
                     peer_info.pending_peer = ""
 
+        if call_id:
+            self._discard_session(call_id)
         if username and target:
             self._end_call(username, target, notify=True)
 
@@ -434,20 +470,26 @@ class StreamServer:
         except Exception:
             pass
 
+        if username:
+            self._broadcast_user_list()
+
     def _end_call(self, username: str, target: str, notify: bool = True) -> None:
         if not username or not target:
             return
 
         target_cid: Optional[int]
         target_info: Optional[ClientInfo]
+        call_id = ""
 
         with self._lock:
             user_cid = self._nickname_map.get(username)
             user_info = self._clients.get(user_cid) if user_cid else None
             if user_info:
+                call_id = user_info.call_id
                 user_info.pending_peer = ""
                 user_info.in_call_with = ""
                 user_info.call_mode = ""
+                user_info.call_id = ""
 
             target_cid = self._nickname_map.get(target)
             target_info = self._clients.get(target_cid) if target_cid else None
@@ -455,45 +497,90 @@ class StreamServer:
                 if target_info.pending_peer == username:
                     target_info.pending_peer = ""
                 if target_info.in_call_with == username:
+                    call_id = call_id or target_info.call_id
                     target_info.in_call_with = ""
                     target_info.call_mode = ""
+                    target_info.call_id = ""
+
+        if call_id:
+            self._discard_session(call_id)
 
         if notify and target_cid and target_info:
-            hangup = json.dumps(
-                {
-                    "type": "call_hangup",
-                    "peer": username,
-                },
-                ensure_ascii=False,
-            )
+            hangup = json.dumps({"type": "call_hangup", "peer": username}, ensure_ascii=False)
             self._send_by_cid(target_cid, hangup)
         print(f"[Server] Call ended: {username} x {target}")
 
-    def _decide_call_mode(self, caller: ClientInfo, callee: ClientInfo) -> tuple[str, str]:
-        if self._same_subnet(
-            caller.local_ip,
-            caller.subnet_prefix,
-            callee.local_ip,
-            callee.subnet_prefix,
-        ):
-            return "p2p", f"same subnet {caller.local_ip}/{caller.subnet_prefix} <-> {callee.local_ip}/{callee.subnet_prefix}"
-        return "relay", f"different subnet {caller.local_ip}/{caller.subnet_prefix} -> {callee.local_ip}/{callee.subnet_prefix}"
+    def _arm_negotiation_timer(self, call_id: str) -> None:
+        timer = threading.Timer(
+            NEGOTIATION_TIMEOUT_SEC,
+            lambda: self._finalize_session(
+                call_id,
+                mode="relay",
+                reason="direct UDP was not confirmed in time",
+            ),
+        )
+        timer.daemon = True
+        with self._lock:
+            session = self._sessions.get(call_id)
+            if not session:
+                return
+            session.timer = timer
+        timer.start()
 
-    def _same_subnet(
-        self,
-        ip_a: str,
-        prefix_a: int,
-        ip_b: str,
-        prefix_b: int,
-    ) -> bool:
-        try:
-            addr_a = ipaddress.ip_address(ip_a)
-            addr_b = ipaddress.ip_address(ip_b)
-            net_a = ipaddress.ip_network(f"{ip_a}/{prefix_a}", strict=False)
-            net_b = ipaddress.ip_network(f"{ip_b}/{prefix_b}", strict=False)
-        except ValueError:
-            return False
-        return addr_b in net_a and addr_a in net_b
+    def _finalize_session(self, call_id: str, mode: str, reason: str) -> None:
+        with self._lock:
+            session = self._sessions.get(call_id)
+            if not session or session.final_mode:
+                return
+            session.final_mode = mode
+            if session.timer:
+                session.timer.cancel()
+                session.timer = None
+
+            caller_cid = self._nickname_map.get(session.caller)
+            callee_cid = self._nickname_map.get(session.callee)
+            caller_info = self._clients.get(caller_cid) if caller_cid else None
+            callee_info = self._clients.get(callee_cid) if callee_cid else None
+
+            if caller_info and caller_info.call_id == call_id:
+                caller_info.call_mode = mode
+            if callee_info and callee_info.call_id == call_id:
+                callee_info.call_mode = mode
+
+            caller_msg = encode_transport_update(
+                call_id=call_id,
+                peer=session.callee,
+                mode=mode,
+                detail=reason,
+            )
+            callee_msg = encode_transport_update(
+                call_id=call_id,
+                peer=session.caller,
+                mode=mode,
+                detail=reason,
+            )
+
+        self._send_by_cid(caller_cid, caller_msg)
+        self._send_by_cid(callee_cid, callee_msg)
+        print(
+            f"[Server] Transport finalized for call {call_id}: "
+            f"{session.caller} <-> {session.callee} via {mode.upper()} ({reason})"
+        )
+
+    def _discard_session(self, call_id: str) -> None:
+        with self._lock:
+            session = self._sessions.pop(call_id, None)
+        if session and session.timer:
+            session.timer.cancel()
+
+    def _broadcast_user_list(self) -> None:
+        with self._lock:
+            users = sorted(self._nickname_map.keys())
+            cids = list(self._nickname_map.values())
+        msg = encode_user_list(users)
+        for cid in cids:
+            self._send_by_cid(cid, msg)
+        print(f"[Server] Online users: {users}")
 
     def _udp_loop(self) -> None:
         while self._running:
@@ -519,14 +606,18 @@ class StreamServer:
                 if sender_info:
                     sender_info.udp_observed_addr = addr
 
+            if not sender_info:
+                continue
+
             if packet_type == "media_probe":
-                print(f"[Server] UDP probe from {sender} at {addr}")
+                print(f"[Server] UDP relay probe from {sender} at {addr}")
                 continue
 
             target = str(packet.get("target", "")).strip()
-            if not target or not sender_info:
+            if not target or sender_info.in_call_with != target:
                 continue
-            if sender_info.call_mode != "relay" or sender_info.in_call_with != target:
+
+            if sender_info.call_mode == "p2p":
                 continue
 
             with self._lock:
@@ -534,7 +625,10 @@ class StreamServer:
                 target_info = self._clients.get(target_cid) if target_cid else None
                 if not target_info:
                     continue
-                forward_addr = target_info.udp_observed_addr or (target_info.addr[0], target_info.media_port)
+                forward_addr = target_info.udp_observed_addr or (
+                    target_info.addr[0],
+                    target_info.media_port,
+                )
 
             try:
                 self._udp_sock.sendto(data, forward_addr)

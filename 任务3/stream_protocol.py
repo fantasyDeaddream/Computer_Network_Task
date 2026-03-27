@@ -16,6 +16,7 @@ ControlMessageType = Literal[
     "login",
     "response",
     "text",
+    "user_list",
     "call_invite",
     "call_accept",
     "call_reject",
@@ -23,6 +24,8 @@ ControlMessageType = Literal[
     "call_busy",
     "call_not_found",
     "call_ready",
+    "transport_update",
+    "direct_path_seen",
     "media_stop",
 ]
 
@@ -33,14 +36,12 @@ def encode_login(
     nickname: str,
     media_port: int,
     local_ip: str,
-    subnet_prefix: int,
 ) -> str:
     msg = {
         "type": "login",
         "nickname": nickname,
         "media_port": media_port,
         "local_ip": local_ip,
-        "subnet_prefix": subnet_prefix,
     }
     return json.dumps(msg, ensure_ascii=False)
 
@@ -59,6 +60,10 @@ def encode_response(success: bool, message: str, data: dict | None = None) -> st
 def encode_text(content: str, target: str = "") -> str:
     msg = {"type": "text", "content": content, "target": target}
     return json.dumps(msg, ensure_ascii=False)
+
+
+def encode_user_list(users: list[str]) -> str:
+    return json.dumps({"type": "user_list", "users": users}, ensure_ascii=False)
 
 
 def encode_call_invite(target: str) -> str:
@@ -87,6 +92,7 @@ def encode_call_not_found(target: str) -> str:
 
 
 def encode_call_ready(
+    call_id: str,
     peer: str,
     mode: str,
     peer_ip: str = "",
@@ -96,12 +102,38 @@ def encode_call_ready(
 ) -> str:
     msg = {
         "type": "call_ready",
+        "call_id": call_id,
         "peer": peer,
         "mode": mode,
         "peer_ip": peer_ip,
         "peer_port": peer_port,
         "relay_port": relay_port,
         "detail": detail,
+    }
+    return json.dumps(msg, ensure_ascii=False)
+
+
+def encode_transport_update(
+    call_id: str,
+    peer: str,
+    mode: str,
+    detail: str = "",
+) -> str:
+    msg = {
+        "type": "transport_update",
+        "call_id": call_id,
+        "peer": peer,
+        "mode": mode,
+        "detail": detail,
+    }
+    return json.dumps(msg, ensure_ascii=False)
+
+
+def encode_direct_path_seen(call_id: str, target: str) -> str:
+    msg = {
+        "type": "direct_path_seen",
+        "call_id": call_id,
+        "target": target,
     }
     return json.dumps(msg, ensure_ascii=False)
 
@@ -134,11 +166,12 @@ def encode_audio_frame(
     return json.dumps(msg, ensure_ascii=False)
 
 
-def encode_media_probe(sender: str, target: str, mode: str) -> str:
+def encode_media_probe(sender: str, target: str, call_id: str, mode: str) -> str:
     msg = {
         "kind": "media_probe",
         "sender": sender,
         "target": target,
+        "call_id": call_id,
         "mode": mode,
     }
     return json.dumps(msg, ensure_ascii=False)
@@ -158,6 +191,7 @@ def decode_message(raw: str) -> tuple[str, dict]:
         "login",
         "response",
         "text",
+        "user_list",
         "call_invite",
         "call_accept",
         "call_reject",
@@ -165,6 +199,8 @@ def decode_message(raw: str) -> tuple[str, dict]:
         "call_busy",
         "call_not_found",
         "call_ready",
+        "transport_update",
+        "direct_path_seen",
         "media_stop",
     }
     if msg_type not in valid_types:
