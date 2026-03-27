@@ -534,8 +534,25 @@ class ConferenceClient:
 
         elif mtype == "room_dismissed_notify":
             room_id = payload.get("room_id", "")
-            self._stop_audio()
+            # 如果当前已不在聊天室中（创建者自己解散时已清理），跳过处理
+            if not self._room_id:
+                return
+            # 在接收线程中不调用 _stop_audio()（含 time.sleep），
+            # 仅标记停止并清理状态，音频线程会自行退出
+            self._is_streaming = False
             self._teardown_udp()
+
+            # 延迟关闭 _in_stream，避免阻塞接收线程
+            def _deferred_close_input():
+                try:
+                    if self._in_stream:
+                        self._in_stream.stop_stream()
+                        self._in_stream.close()
+                except Exception:
+                    pass
+                self._in_stream = None
+
+            threading.Thread(target=_deferred_close_input, daemon=True).start()
             self._room_id = ""
             self._room_state = RoomState.IDLE
             self._is_creator = False
