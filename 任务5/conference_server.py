@@ -1,8 +1,11 @@
 """
-任务5 - 多方语音会议系统服务器
+任务5 - 多方语音会议系统服务端
 
-在任务4服务器基础上扩展，增加聊天室管理和组播音频转发功能。
+控制面继续使用 TCP + JSON，音频面改为由服务端分配 IP 组播地址，
+客户端直接通过 UDP 组播收发语音数据，服务端不再做逐个成员转发。
 """
+
+from __future__ import annotations
 
 import json
 import random
@@ -15,14 +18,15 @@ from typing import Dict, List, Optional, Set, Tuple
 import sys
 
 from conference_protocol import (
+    MESSAGE_DELIMITER,
+    MAX_ROOM_SIZE,
     decode_message,
     encode_response,
-    encode_room_invite_notify,
     encode_room_dismissed_notify,
+    encode_room_invite_notify,
     encode_room_member_update,
-    MAX_ROOM_SIZE,
-    MESSAGE_DELIMITER,
 )
+from multicast_audio import allocate_multicast_endpoint
 
 
 def _ensure_task4_on_path() -> None:
@@ -44,35 +48,34 @@ class ClientInfo:
     addr: Tuple[str, int]
     username: str = ""
     room_id: str = ""
-    udp_addr: Optional[Tuple[str, int]] = None  # 客户端的UDP地址（用于UDP音频转发）
 
 
 @dataclass
 class ChatRoom:
     room_id: str
     creator: str
-    audio_protocol: str = "tcp"  # "tcp" 或 "udp"
+    audio_protocol: str = "udp"
     members: Dict[str, int] = field(default_factory=dict)
     invited: Set[str] = field(default_factory=set)
-    udp_port: int = 0  # UDP模式下服务器分配的UDP端口
-    _udp_sock: Optional[socket.socket] = field(default=None, repr=False)
+    multicast_group: str = ""
+    multicast_port: int = 0
 
     def get_available_positions(self) -> List[int]:
         used = set(self.members.values())
-        return [i for i in range(MAX_ROOM_SIZE) if i not in used]
+        return [index for index in range(MAX_ROOM_SIZE) if index not in used]
 
     def assign_position(self, username: str) -> int:
         available = self.get_available_positions()
         if not available:
             return -1
-        pos = random.choice(available)
-        self.members[username] = pos
-        return pos
+        position = random.choice(available)
+        self.members[username] = position
+        return position
 
     def get_member_list(self) -> List[dict]:
         return [
-            {"username": u, "position": p}
-            for u, p in sorted(self.members.items(), key=lambda x: x[1])
+            {"username": username, "position": position}
+            for username, position in sorted(self.members.items(), key=lambda item: item[1])
         ]
 
 
@@ -102,7 +105,9 @@ class ConferenceServer:
                 except OSError:
                     break
                 threading.Thread(
-                    target=self._handle_client, args=(conn, addr), daemon=True
+                    target=self._handle_client,
+                    args=(conn, addr),
+                    daemon=True,
                 ).start()
         finally:
             self._cleanup()
@@ -112,22 +117,22 @@ class ConferenceServer:
         self._running = False
         try:
             self._sock.close()
-        except Exception:
+        except OSError:
             pass
 
     def _cleanup(self) -> None:
         with self._lock:
-            for cid, info in list(self._clients.items()):
+            for info in self._clients.values():
                 try:
                     info.conn.close()
-                except Exception:
+                except OSError:
                     pass
             self._clients.clear()
             self._username_map.clear()
             self._rooms.clear()
         try:
             self._sock.close()
-        except Exception:
+        except OSError:
             pass
 
     def _handle_client(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
@@ -135,29 +140,37 @@ class ConferenceServer:
         with self._lock:
             self._clients[cid] = ClientInfo(conn=conn, addr=addr)
         print(f"[Server] New connection: {addr}")
-        buf = ""
+
+        buffer = ""
         try:
             while self._running:
                 data = conn.recv(4096)
                 if not data:
                     break
-                buf += data.decode("utf-8", errors="ignore")
-                while MESSAGE_DELIMITER in buf:
-                    line, buf = buf.split(MESSAGE_DELIMITER, 1)
+                buffer += data.decode("utf-8", errors="ignore")
+                while MESSAGE_DELIMITER in buffer:
+                    line, buffer = buffer.split(MESSAGE_DELIMITER, 1)
                     line = line.strip()
                     if not line:
                         continue
                     try:
-                        mtype, payload = decode_message(line)
+                        message_type, payload = decode_message(line)
                     except ValueError:
                         continue
-                    self._dispatch(cid, mtype, payload, conn, line)
+                    self._dispatch(cid, message_type, payload, conn, line)
         except ConnectionResetError:
             pass
         finally:
             self._handle_disconnect(cid)
 
-    def _dispatch(self, cid, mtype, payload, conn, raw):
+    def _dispatch(
+        self,
+        cid: int,
+        message_type: str,
+        payload: dict,
+        conn: socket.socket,
+        raw: str,
+    ) -> None:
         handlers = {
             "login": lambda: self._handle_login(cid, payload, conn),
             "logout": lambda: self._handle_logout(cid),
@@ -174,17 +187,16 @@ class ConferenceServer:
             "room_dismiss": lambda: self._handle_room_dismiss(cid, payload),
             "room_audio_chunk": lambda: self._forward_room_audio(cid, raw),
         }
-        h = handlers.get(mtype)
-        if h:
-            h()
+        handler = handlers.get(message_type)
+        if handler:
+            handler()
 
-    # ---- auth ----
-
-    def _handle_login(self, cid, payload, conn):
+    def _handle_login(self, cid: int, payload: dict, conn: socket.socket) -> None:
         username = payload.get("username", "")
         if not username:
             self._send(conn, encode_response(False, "用户名不能为空"))
             return
+
         self._data_store.ensure_user(username)
         with self._lock:
             if username in self._username_map:
@@ -194,10 +206,11 @@ class ConferenceServer:
             if info:
                 info.username = username
             self._username_map[username] = cid
+
         self._send(conn, encode_response(True, "登录成功"))
         print(f"[Server] {username} logged in")
 
-    def _handle_logout(self, cid):
+    def _handle_logout(self, cid: int) -> None:
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
@@ -208,7 +221,7 @@ class ConferenceServer:
             print(f"[Server] {info.username} logged out")
             info.username = ""
 
-    def _handle_disconnect(self, cid):
+    def _handle_disconnect(self, cid: int) -> None:
         with self._lock:
             info = self._clients.pop(cid, None)
             if info and info.username:
@@ -216,51 +229,48 @@ class ConferenceServer:
                     self._remove_from_room(info.username, info.room_id)
                 self._username_map.pop(info.username, None)
 
-    # ---- contacts ----
-
-    def _handle_contact_op(self, cid, payload, op):
+    def _handle_contact_op(self, cid: int, payload: dict, op: str) -> None:
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
                 self._send_by_cid(cid, encode_response(False, "未登录"))
                 return
-            uname = info.username
+            username = info.username
 
         if op == "add":
-            cn = payload.get("contact_name", "")
-            if not cn:
+            contact_name = payload.get("contact_name", "")
+            if not contact_name:
                 self._send_by_cid(cid, encode_response(False, "联系人名称不能为空"))
                 return
-            ok, msg = self._data_store.add_contact(uname, cn)
-            self._send_by_cid(cid, encode_response(ok, msg))
+            ok, message = self._data_store.add_contact(username, contact_name)
+            self._send_by_cid(cid, encode_response(ok, message))
         elif op == "delete":
-            cn = payload.get("contact_name", "")
-            ok, msg = self._data_store.delete_contact(uname, cn)
-            self._send_by_cid(cid, encode_response(ok, msg))
+            contact_name = payload.get("contact_name", "")
+            ok, message = self._data_store.delete_contact(username, contact_name)
+            self._send_by_cid(cid, encode_response(ok, message))
         elif op == "update":
-            old = payload.get("old_name", "")
-            new = payload.get("new_name", "")
-            if not old or not new:
+            old_name = payload.get("old_name", "")
+            new_name = payload.get("new_name", "")
+            if not old_name or not new_name:
                 self._send_by_cid(cid, encode_response(False, "联系人名称不能为空"))
                 return
-            ok, msg = self._data_store.update_contact(uname, old, new)
-            self._send_by_cid(cid, encode_response(ok, msg))
+            ok, message = self._data_store.update_contact(username, old_name, new_name)
+            self._send_by_cid(cid, encode_response(ok, message))
         elif op == "list":
-            contacts = self._data_store.get_contacts(uname)
+            contacts = self._data_store.get_contacts(username)
             self._send_by_cid(
-                cid, encode_response(True, "获取成功", {"contacts": contacts})
+                cid,
+                encode_response(True, "获取成功", {"contacts": contacts}),
             )
         elif op == "search":
-            kw = payload.get("keyword", "")
-            contacts = self._data_store.search_contacts(uname, kw)
+            keyword = payload.get("keyword", "")
+            contacts = self._data_store.search_contacts(username, keyword)
             self._send_by_cid(
-                cid, encode_response(True, "搜索成功", {"contacts": contacts})
+                cid,
+                encode_response(True, "搜索成功", {"contacts": contacts}),
             )
 
-    # ---- online query ----
-
-    def _handle_online_query(self, cid):
-        """返回当前所有在线用户列表"""
+    def _handle_online_query(self, cid: int) -> None:
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
@@ -268,17 +278,15 @@ class ConferenceServer:
                 return
             online_users = list(self._username_map.keys())
         self._send_by_cid(
-            cid, encode_response(True, "查询成功", {"online_users": online_users})
+            cid,
+            encode_response(True, "查询成功", {"online_users": online_users}),
         )
 
-    # ---- room ----
-
-    def _handle_room_create(self, cid, payload=None):
-        if payload is None:
-            payload = {}
-        audio_protocol = payload.get("audio_protocol", "tcp")
-        if audio_protocol not in ("tcp", "udp"):
-            audio_protocol = "tcp"
+    def _handle_room_create(self, cid: int, payload: Optional[dict] = None) -> None:
+        payload = payload or {}
+        audio_protocol = payload.get("audio_protocol", "udp")
+        if audio_protocol != "udp":
+            audio_protocol = "udp"
 
         with self._lock:
             info = self._clients.get(cid)
@@ -288,39 +296,41 @@ class ConferenceServer:
             if info.room_id:
                 self._send_by_cid(cid, encode_response(False, "您已在聊天室中"))
                 return
+
+            room_id = uuid.uuid4().hex[:8]
             creator = info.username
-            rid = uuid.uuid4().hex[:8]
-            room = ChatRoom(room_id=rid, creator=creator, audio_protocol=audio_protocol)
-            pos = room.assign_position(creator)
+            room = ChatRoom(room_id=room_id, creator=creator, audio_protocol=audio_protocol)
+            position = room.assign_position(creator)
+            used_endpoints = {
+                (item.multicast_group, item.multicast_port)
+                for item in self._rooms.values()
+                if item.multicast_group and item.multicast_port
+            }
+            room.multicast_group, room.multicast_port = allocate_multicast_endpoint(
+                used_endpoints
+            )
+            self._rooms[room_id] = room
+            info.room_id = room_id
 
-            # UDP模式：为聊天室创建UDP socket
-            if audio_protocol == "udp":
-                udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                udp_sock.bind((self._host, 0))  # 绑定随机端口
-                udp_port = udp_sock.getsockname()[1]
-                room.udp_port = udp_port
-                room._udp_sock = udp_sock
-                # 启动UDP接收转发线程
-                threading.Thread(
-                    target=self._udp_recv_loop, args=(rid,), daemon=True
-                ).start()
-                print(f"[Server] Room {rid} UDP port: {udp_port}")
-
-            self._rooms[rid] = room
-            info.room_id = rid
-
-        resp_data = {"room_id": rid, "position": pos, "audio_protocol": audio_protocol}
-        if audio_protocol == "udp":
-            resp_data["udp_port"] = room.udp_port
-        print(f"[Server] Room {rid} created by {creator} (audio: {audio_protocol})")
+        response_data = {
+            "room_id": room_id,
+            "position": position,
+            "audio_protocol": audio_protocol,
+            "multicast_group": room.multicast_group,
+            "multicast_port": room.multicast_port,
+        }
         self._send_by_cid(
             cid,
-            encode_response(True, "聊天室创建成功", resp_data),
+            encode_response(True, "聊天室创建成功", response_data),
         )
-        self._broadcast_member_update(rid)
+        print(
+            f"[Server] Room {room_id} created by {creator} "
+            f"(group={room.multicast_group}:{room.multicast_port})"
+        )
+        self._broadcast_member_update(room_id)
 
-    def _handle_room_invite(self, cid, payload):
-        rid = payload.get("room_id", "")
+    def _handle_room_invite(self, cid: int, payload: dict) -> None:
+        room_id = payload.get("room_id", "")
         target = payload.get("target", "")
         with self._lock:
             info = self._clients.get(cid)
@@ -328,7 +338,7 @@ class ConferenceServer:
                 self._send_by_cid(cid, encode_response(False, "未登录"))
                 return
             inviter = info.username
-            room = self._rooms.get(rid)
+            room = self._rooms.get(room_id)
             if not room:
                 self._send_by_cid(cid, encode_response(False, "聊天室不存在"))
                 return
@@ -341,235 +351,175 @@ class ConferenceServer:
             if target not in self._username_map:
                 self._send_by_cid(cid, encode_response(False, f"{target} 不在线"))
                 return
-            tcid = self._username_map[target]
-            tinfo = self._clients.get(tcid)
-            if tinfo and tinfo.room_id:
-                self._send_by_cid(
-                    cid, encode_response(False, f"{target} 已在其他聊天室中")
-                )
+            target_cid = self._username_map[target]
+            target_info = self._clients.get(target_cid)
+            if target_info and target_info.room_id:
+                self._send_by_cid(cid, encode_response(False, f"{target} 已在其他聊天室中"))
                 return
             room.invited.add(target)
-        notify = encode_room_invite_notify(rid, inviter, target)
-        self._send_by_cid(tcid, notify)
-        self._send_by_cid(cid, encode_response(True, f"已邀请 {target}"))
-        print(f"[Server] {inviter} invited {target} to room {rid}")
 
-    def _handle_room_join(self, cid, payload):
-        rid = payload.get("room_id", "")
+        self._send_by_cid(target_cid, encode_room_invite_notify(room_id, inviter, target))
+        self._send_by_cid(cid, encode_response(True, f"已邀请 {target}"))
+        print(f"[Server] {inviter} invited {target} to room {room_id}")
+
+    def _handle_room_join(self, cid: int, payload: dict) -> None:
+        room_id = payload.get("room_id", "")
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
                 self._send_by_cid(cid, encode_response(False, "未登录"))
                 return
-            uname = info.username
+            username = info.username
             if info.room_id:
                 self._send_by_cid(cid, encode_response(False, "您已在聊天室中"))
                 return
-            room = self._rooms.get(rid)
+            room = self._rooms.get(room_id)
             if not room:
                 self._send_by_cid(cid, encode_response(False, "聊天室不存在"))
                 return
-            if uname not in room.invited and uname != room.creator:
+            if username not in room.invited and username != room.creator:
                 self._send_by_cid(cid, encode_response(False, "您未被邀请"))
                 return
             if len(room.members) >= MAX_ROOM_SIZE:
                 self._send_by_cid(cid, encode_response(False, "聊天室已满"))
                 return
-            pos = room.assign_position(uname)
-            room.invited.discard(uname)
-            info.room_id = rid
-            join_data = {
-                "room_id": rid,
-                "position": pos,
+
+            position = room.assign_position(username)
+            room.invited.discard(username)
+            info.room_id = room_id
+            response_data = {
+                "room_id": room_id,
+                "position": position,
                 "creator": room.creator,
                 "audio_protocol": room.audio_protocol,
+                "multicast_group": room.multicast_group,
+                "multicast_port": room.multicast_port,
             }
-            if room.audio_protocol == "udp":
-                join_data["udp_port"] = room.udp_port
-        print(f"[Server] {uname} joined room {rid} at pos {pos}")
+
         self._send_by_cid(
             cid,
-            encode_response(True, "加入聊天室成功", join_data),
+            encode_response(True, "加入聊天室成功", response_data),
         )
-        self._broadcast_member_update(rid)
+        print(f"[Server] {username} joined room {room_id} at pos {position}")
+        self._broadcast_member_update(room_id)
 
-    def _handle_room_leave(self, cid, payload):
-        rid = payload.get("room_id", "")
+    def _handle_room_leave(self, cid: int, payload: dict) -> None:
+        room_id = payload.get("room_id", "")
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
                 return
-            uname = info.username
-        self._remove_from_room(uname, rid)
+            username = info.username
+        self._remove_from_room(username, room_id)
         self._send_by_cid(cid, encode_response(True, "已退出聊天室"))
 
-    def _handle_room_dismiss(self, cid, payload):
-        rid = payload.get("room_id", "")
+    def _handle_room_dismiss(self, cid: int, payload: dict) -> None:
+        room_id = payload.get("room_id", "")
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
                 return
-            uname = info.username
-            room = self._rooms.get(rid)
+            username = info.username
+            room = self._rooms.get(room_id)
             if not room:
                 self._send_by_cid(cid, encode_response(False, "聊天室不存在"))
                 return
-            if room.creator != uname:
-                self._send_by_cid(
-                    cid, encode_response(False, "只有创建者可以解散聊天室")
-                )
+            if room.creator != username:
+                self._send_by_cid(cid, encode_response(False, "只有创建者可以解散聊天室"))
                 return
-            dismiss_msg = encode_room_dismissed_notify(rid)
-            for m in list(room.members.keys()):
-                if m in self._username_map:
-                    mc = self._username_map[m]
-                    mi = self._clients.get(mc)
-                    if mi:
-                        mi.room_id = ""
-                        mi.udp_addr = None
-                    self._send_by_cid(mc, dismiss_msg)
-            self._close_room_udp(room)
-            del self._rooms[rid]
-        print(f"[Server] Room {rid} dismissed by {uname}")
 
-    def _remove_from_room(self, username, room_id):
+            dismissed_message = encode_room_dismissed_notify(room_id)
+            for member in list(room.members.keys()):
+                member_cid = self._username_map.get(member)
+                if member_cid is None:
+                    continue
+                member_info = self._clients.get(member_cid)
+                if member_info:
+                    member_info.room_id = ""
+                self._send_by_cid(member_cid, dismissed_message)
+            del self._rooms[room_id]
+
+        print(f"[Server] Room {room_id} dismissed by {username}")
+
+    def _remove_from_room(self, username: str, room_id: str) -> None:
         with self._lock:
             room = self._rooms.get(room_id)
             if not room or username not in room.members:
                 return
+
             if room.creator == username:
-                dm = encode_room_dismissed_notify(room_id)
-                for m in list(room.members.keys()):
-                    if m in self._username_map:
-                        mc = self._username_map[m]
-                        mi = self._clients.get(mc)
-                        if mi:
-                            mi.room_id = ""
-                            mi.udp_addr = None
-                        self._send_by_cid(mc, dm)
-                self._close_room_udp(room)
+                dismissed_message = encode_room_dismissed_notify(room_id)
+                for member in list(room.members.keys()):
+                    member_cid = self._username_map.get(member)
+                    if member_cid is None:
+                        continue
+                    member_info = self._clients.get(member_cid)
+                    if member_info:
+                        member_info.room_id = ""
+                    self._send_by_cid(member_cid, dismissed_message)
                 del self._rooms[room_id]
                 print(f"[Server] Room {room_id} dismissed (creator left)")
                 return
+
             del room.members[username]
-            if username in self._username_map:
-                uc = self._username_map[username]
-                ui = self._clients.get(uc)
-                if ui:
-                    ui.room_id = ""
-                    ui.udp_addr = None
+            user_cid = self._username_map.get(username)
+            if user_cid is not None:
+                user_info = self._clients.get(user_cid)
+                if user_info:
+                    user_info.room_id = ""
+
         print(f"[Server] {username} left room {room_id}")
         self._broadcast_member_update(room_id)
 
-    def _broadcast_member_update(self, rid):
+    def _broadcast_member_update(self, room_id: str) -> None:
         with self._lock:
-            room = self._rooms.get(rid)
+            room = self._rooms.get(room_id)
             if not room:
                 return
             members = room.get_member_list()
             positions = dict(room.members)
-            msg = encode_room_member_update(rid, members, positions)
-            for m in list(room.members.keys()):
-                if m in self._username_map:
-                    self._send_by_cid(self._username_map[m], msg)
+            message = encode_room_member_update(room_id, members, positions)
+            member_cids = [
+                self._username_map[member]
+                for member in room.members
+                if member in self._username_map
+            ]
+        for member_cid in member_cids:
+            self._send_by_cid(member_cid, message)
 
-    def _forward_room_audio(self, cid, raw):
-        """TCP模式下的音频转发"""
+    def _forward_room_audio(self, cid: int, raw: str) -> None:
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.room_id:
                 return
             room = self._rooms.get(info.room_id)
-            if not room:
+            if not room or room.audio_protocol != "tcp":
                 return
             sender = info.username
-            for m in list(room.members.keys()):
-                if m == sender:
-                    continue
-                if m in self._username_map:
-                    self._send_by_cid(self._username_map[m], raw)
+            member_cids = [
+                self._username_map[member]
+                for member in room.members
+                if member != sender and member in self._username_map
+            ]
+        for member_cid in member_cids:
+            self._send_by_cid(member_cid, raw)
 
-    def _udp_recv_loop(self, room_id: str) -> None:
-        """UDP模式下的音频接收和转发循环
-
-        每个UDP聊天室有一个独立的UDP socket。
-        客户端发送的UDP数据包格式：前32字节为用户名（UTF-8，右侧补零），其余为音频数据。
-        服务器收到后转发给同一聊天室的其他成员。
-        """
-        while self._running:
-            with self._lock:
-                room = self._rooms.get(room_id)
-                if not room or not room._udp_sock:
-                    break
-                udp_sock = room._udp_sock
-
-            try:
-                udp_sock.settimeout(1.0)
-                data, addr = udp_sock.recvfrom(65535)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-
-            if len(data) < 32:
-                continue
-
-            # 解析发送者用户名（前32字节）
-            sender = data[:32].rstrip(b"\x00").decode("utf-8", errors="ignore")
-            audio_data = data[32:]
-
-            with self._lock:
-                room = self._rooms.get(room_id)
-                if not room or not room._udp_sock:
-                    break
-
-                # 记录发送者的UDP地址
-                if sender in self._username_map:
-                    scid = self._username_map[sender]
-                    sinfo = self._clients.get(scid)
-                    if sinfo:
-                        sinfo.udp_addr = addr
-
-                # 转发给其他成员
-                for m in list(room.members.keys()):
-                    if m == sender:
-                        continue
-                    if m in self._username_map:
-                        mcid = self._username_map[m]
-                        minfo = self._clients.get(mcid)
-                        if minfo and minfo.udp_addr:
-                            try:
-                                udp_sock.sendto(audio_data, minfo.udp_addr)
-                            except Exception:
-                                pass
-
-        print(f"[Server] UDP recv loop for room {room_id} stopped")
-
-    def _close_room_udp(self, room: ChatRoom) -> None:
-        """关闭聊天室的UDP socket"""
-        if room._udp_sock:
-            try:
-                room._udp_sock.close()
-            except Exception:
-                pass
-            room._udp_sock = None
-
-    # ---- network ----
-
-    def _send(self, conn, msg):
+    def _send(self, conn: socket.socket, message: str) -> None:
         try:
-            conn.sendall((msg + MESSAGE_DELIMITER).encode("utf-8"))
-        except Exception:
+            conn.sendall((message + MESSAGE_DELIMITER).encode("utf-8"))
+        except OSError:
             pass
 
-    def _send_by_cid(self, cid, msg):
+    def _send_by_cid(self, cid: int, message: str) -> None:
         with self._lock:
             info = self._clients.get(cid)
-            if info:
-                self._send(info.conn, msg)
+            if info is None:
+                return
+            conn = info.conn
+        self._send(conn, message)
 
 
-def main():
+def main() -> None:
     server = ConferenceServer()
     try:
         print("=" * 50)
