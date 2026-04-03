@@ -9,7 +9,8 @@
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+import ttkbootstrap as ttk
+from tkinter import messagebox, simpledialog
 from typing import Optional
 from pathlib import Path
 import sys
@@ -345,7 +346,7 @@ class TelephoneFrame(ttk.Frame):
         """弹出对话框让用户选择音频传输协议，然后创建聊天室"""
         dialog = tk.Toplevel(self)
         dialog.title("创建聊天室")
-        dialog.geometry("320x180")
+        dialog.geometry("400x250")
         dialog.resizable(False, False)
         dialog.transient(self.winfo_toplevel())
         dialog.grab_set()
@@ -471,7 +472,7 @@ class TelephoneFrame(ttk.Frame):
 # ============================================================
 class ChatRoomFrame(ttk.Frame):
 
-    AVATAR_SIZE = 50
+    AVATAR_SIZE = 80
     COLS = 5
     ROWS = 4
 
@@ -570,7 +571,7 @@ class ChatRoomFrame(ttk.Frame):
                 cell,
                 text="空位",
                 foreground="#aaaaaa",
-                font=("微软雅黑", 8),
+                font=("微软雅黑", 12),
                 anchor="center",
                 width=8,
             )
@@ -601,7 +602,7 @@ class ChatRoomFrame(ttk.Frame):
         """弹出邀请对话框，支持从电话本下拉选择联系人（显示在线状态）"""
         dialog = tk.Toplevel(self)
         dialog.title("邀请用户")
-        dialog.geometry("350x200")
+        dialog.geometry("400x250")
         dialog.resizable(False, False)
         dialog.transient(self.winfo_toplevel())
         dialog.grab_set()
@@ -803,13 +804,17 @@ class ChatRoomFrame(ttk.Frame):
 # ============================================================
 # ClientGUI - 主窗口
 # ============================================================
-class ClientGUI(tk.Tk):
+class ClientGUI(ttk.Window):
 
     def __init__(self):
-        super().__init__()
+        super().__init__(themename="litera")
         self.title("任务5 - 多方语音会议系统")
-        self.geometry("700x600")
-        self.minsize(600, 500)
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        width = int(screen_width * 0.8)
+        height = int(screen_height * 0.7)
+        self.geometry(f"{width}x{height}")
+        self.minsize(800, 600)
 
         self._client: Optional[ConferenceClient] = None
         self._username = ""
