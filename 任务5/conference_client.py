@@ -129,6 +129,7 @@ class ConferenceClient:
         self._multicast_group = ""
         self._multicast_port = 0
         self._multicast_interface_ip = "0.0.0.0"
+        self._multicast_memberships: List[bytes] = []
         self._multicast_recv_sock: Optional[socket.socket] = None
         self._multicast_send_sock: Optional[socket.socket] = None
 
@@ -144,6 +145,7 @@ class ConferenceClient:
         self._packet_sequence = 0
         self._previous_capture_frame: Optional[bytes] = None
         self._previous_capture_timestamp_ms: Optional[int] = None
+        self._udp_packet_seen = False
 
         self._audio_streams_lock = threading.RLock()
         self._remote_audio_streams: Dict[bytes, RemoteAudioStream] = {}
@@ -439,14 +441,40 @@ class ConferenceClient:
         except (AttributeError, OSError):
             pass
         recv_sock.bind(("", multicast_port))
-
-        membership = socket.inet_aton(multicast_group) + socket.inet_aton(interface_ip)
+        memberships: List[bytes] = []
+        membership_candidates = [interface_ip, "0.0.0.0"]
         try:
-            recv_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+            membership_candidates.extend(socket.gethostbyname_ex(socket.gethostname())[2])
         except OSError:
-            interface_ip = "0.0.0.0"
-            membership = socket.inet_aton(multicast_group) + socket.inet_aton(interface_ip)
+            pass
+        if self._host in {"localhost", "127.0.0.1"}:
+            membership_candidates.append("127.0.0.1")
+
+        seen_membership_ips = set()
+        for membership_ip in membership_candidates:
+            if not membership_ip or membership_ip in seen_membership_ips:
+                continue
+            seen_membership_ips.add(membership_ip)
+            try:
+                membership = socket.inet_aton(multicast_group) + socket.inet_aton(
+                    membership_ip
+                )
+            except OSError:
+                continue
+            try:
+                recv_sock.setsockopt(
+                    socket.IPPROTO_IP,
+                    socket.IP_ADD_MEMBERSHIP,
+                    membership,
+                )
+                memberships.append(membership)
+            except OSError:
+                continue
+        if not memberships:
+            membership = socket.inet_aton(multicast_group) + socket.inet_aton("0.0.0.0")
             recv_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+            memberships.append(membership)
+            interface_ip = "0.0.0.0"
         recv_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
         recv_sock.settimeout(1.0)
 
@@ -466,32 +494,32 @@ class ConferenceClient:
         self._multicast_group = multicast_group
         self._multicast_port = multicast_port
         self._multicast_interface_ip = interface_ip
+        self._multicast_memberships = memberships
         self._multicast_recv_sock = recv_sock
         self._multicast_send_sock = send_sock
         self._reset_remote_audio_streams()
         print(
             f"[Client] Multicast setup: group={multicast_group}:{multicast_port}, "
-            f"iface={interface_ip}"
+            f"iface={interface_ip}, memberships={len(memberships)}"
         )
 
     def _teardown_udp(self) -> None:
         self._packet_sequence = 0
         self._previous_capture_frame = None
         self._previous_capture_timestamp_ms = None
+        self._udp_packet_seen = False
         self._reset_remote_audio_streams()
 
-        if self._multicast_recv_sock and self._multicast_group:
-            membership = socket.inet_aton(self._multicast_group) + socket.inet_aton(
-                self._multicast_interface_ip or "0.0.0.0"
-            )
-            try:
-                self._multicast_recv_sock.setsockopt(
-                    socket.IPPROTO_IP,
-                    socket.IP_DROP_MEMBERSHIP,
-                    membership,
-                )
-            except OSError:
-                pass
+        if self._multicast_recv_sock:
+            for membership in self._multicast_memberships:
+                try:
+                    self._multicast_recv_sock.setsockopt(
+                        socket.IPPROTO_IP,
+                        socket.IP_DROP_MEMBERSHIP,
+                        membership,
+                    )
+                except OSError:
+                    pass
 
         for sock in (self._multicast_recv_sock, self._multicast_send_sock):
             if not sock:
@@ -506,6 +534,7 @@ class ConferenceClient:
         self._multicast_group = ""
         self._multicast_port = 0
         self._multicast_interface_ip = "0.0.0.0"
+        self._multicast_memberships = []
 
     def _start_audio(self) -> None:
         if not self._p or self._in_stream is not None:
@@ -526,6 +555,7 @@ class ConferenceClient:
         self._packet_sequence = 0
         self._previous_capture_frame = None
         self._previous_capture_timestamp_ms = None
+        self._udp_packet_seen = False
         self._reset_remote_audio_streams()
 
         threading.Thread(target=self._send_audio_loop, daemon=True).start()
@@ -636,6 +666,12 @@ class ConferenceClient:
             stream.buffer.push(packet)
             stream.last_seen_monotonic = time.monotonic()
             stream.last_packet_timestamp_ms = packet.timestamp_ms
+            if not self._udp_packet_seen:
+                self._udp_packet_seen = True
+                print(
+                    f"[Client] First multicast audio packet received "
+                    f"from {stream.display_name} ts={packet.timestamp_ms}"
+                )
 
     def _playout_audio_loop(self) -> None:
         next_deadline = time.monotonic()

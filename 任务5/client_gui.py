@@ -29,6 +29,16 @@ from audio_config import DEFAULT_HOST
 
 from conference_client import ConferenceClient, RoomState
 from conference_protocol import MAX_ROOM_SIZE
+from multicast_audio import resolve_multicast_interface_ip
+
+
+def _default_task5_host() -> str:
+    if DEFAULT_HOST not in {"localhost", "127.0.0.1"}:
+        return DEFAULT_HOST
+    preferred_ip = resolve_multicast_interface_ip("localhost")
+    if preferred_ip and preferred_ip != "0.0.0.0":
+        return preferred_ip
+    return DEFAULT_HOST
 
 
 # ============================================================
@@ -49,7 +59,7 @@ class LoginFrame(ttk.Frame):
         server_box.pack(fill="x", padx=20, pady=5)
 
         ttk.Label(server_box, text="服务器地址").grid(row=0, column=0, sticky="w")
-        self.host_var = tk.StringVar(value=DEFAULT_HOST)
+        self.host_var = tk.StringVar(value=_default_task5_host())
         ttk.Entry(server_box, textvariable=self.host_var, width=20).grid(
             row=0, column=1, padx=(8, 0), sticky="w"
         )
@@ -343,58 +353,10 @@ class TelephoneFrame(ttk.Frame):
         self.hint_text.config(state="disabled")
 
     def _on_create_room(self):
-        """弹出对话框让用户选择音频传输协议，然后创建聊天室"""
-        dialog = tk.Toplevel(self)
-        dialog.title("创建聊天室")
-        dialog.geometry("400x250")
-        dialog.resizable(False, False)
-        dialog.transient(self.winfo_toplevel())
-        dialog.grab_set()
-
-        ttk.Label(dialog, text="请选择音频传输协议:", font=("微软雅黑", 11)).pack(
-            padx=20, pady=(20, 10), anchor="w"
-        )
-
-        protocol_var = tk.StringVar(value="tcp")
-        radio_frame = ttk.Frame(dialog)
-        radio_frame.pack(padx=20, fill="x")
-        ttk.Radiobutton(
-            radio_frame,
-            text="TCP（可靠传输，延迟较高）",
-            variable=protocol_var,
-            value="tcp",
-        ).pack(anchor="w", pady=2)
-        ttk.Radiobutton(
-            radio_frame,
-            text="UDP（低延迟，可能丢包）",
-            variable=protocol_var,
-            value="udp",
-        ).pack(anchor="w", pady=2)
-
-        result = {"protocol": None}
-
-        def on_ok():
-            result["protocol"] = protocol_var.get()
-            dialog.destroy()
-
-        def on_cancel():
-            dialog.destroy()
-
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(pady=15)
-        ttk.Button(btn_frame, text="创建", command=on_ok).pack(side="left", padx=10)
-        ttk.Button(btn_frame, text="取消", command=on_cancel).pack(side="left", padx=10)
-
-        dialog.wait_window()
-
-        if result["protocol"] is None:
-            return
-
         self.btn_create.config(state="disabled")
-        audio_protocol = result["protocol"]
 
         def do_create():
-            ok, msg, data = self._client.create_room(audio_protocol=audio_protocol)
+            ok, msg, data = self._client.create_room(audio_protocol="udp")
             self.after(0, lambda: self._handle_create_result(ok, msg, data))
 
         threading.Thread(target=do_create, daemon=True).start()

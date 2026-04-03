@@ -60,7 +60,7 @@ def main() -> int:
         assert messages and messages[0].get("success") is True, f"Bob login failed: {messages}"
         results.append("PASS: Bob login")
 
-        send_msg(alice, {"type": "room_create", "creator": "alice", "audio_protocol": "tcp"})
+        send_msg(alice, {"type": "room_create", "creator": "alice", "audio_protocol": "udp"})
         time.sleep(0.3)
         messages = recv_all(alice)
         create_response = next(

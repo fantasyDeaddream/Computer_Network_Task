@@ -64,6 +64,11 @@ python server_start.py
 ```bash
 cd 任务5
 python client_gui_start.py
+
+说明：
+
+- 任务5 的控制面可以连 `localhost`，但音频面使用的是 IP 组播。
+- 实际联调时更建议客户端连接服务端的局域网真实 IP，而不是只用 `localhost`。
 ```
 
 ## 测试

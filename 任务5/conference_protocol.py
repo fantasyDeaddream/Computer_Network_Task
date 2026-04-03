@@ -59,12 +59,12 @@ MAX_ROOM_SIZE = 20  # 每个聊天室最多容纳20个用户
 # ========== 聊天室消息编码函数 ==========
 
 
-def encode_room_create(creator: str, audio_protocol: str = "tcp") -> str:
+def encode_room_create(creator: str, audio_protocol: str = "udp") -> str:
     """编码创建聊天室请求
 
     Args:
         creator: 创建者用户名
-        audio_protocol: 音频传输协议，"tcp" 或 "udp"
+        audio_protocol: 音频传输协议，当前固定为 "udp"
     """
     msg = {"type": "room_create", "creator": creator, "audio_protocol": audio_protocol}
     return json.dumps(msg, ensure_ascii=False)
