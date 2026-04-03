@@ -4,8 +4,7 @@
 
 import queue
 import tkinter as tk
-import ttkbootstrap as ttk
-from tkinter import messagebox
+from tkinter import ttk, messagebox
 import threading
 import sys
 from pathlib import Path
@@ -24,16 +23,12 @@ from tk_utils import redirect_stdout_to_queue
 from conference_server import ConferenceServer, DEFAULT_PORT
 
 
-class ServerGUI(ttk.Window):
+class ServerGUI(tk.Tk):
 
     def __init__(self):
-        super().__init__(themename="litera")
+        super().__init__()
         self.title("任务5 - 多方语音会议系统服务器")
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        width = int(screen_width * 0.7)
-        height = int(screen_height * 0.6)
-        self.geometry(f"{width}x{height}")
+        self.geometry("860x560")
         self.minsize(820, 520)
 
         self._log_q: queue.Queue[str] = queue.Queue()
