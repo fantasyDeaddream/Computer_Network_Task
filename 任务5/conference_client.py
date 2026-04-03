@@ -1,9 +1,9 @@
 """
 任务5 - 多方语音会议系统客户端
 
-控制面继续使用 TCP 信令，音频面改为 UDP over IP Multicast。
-客户端发送的每个音频包都携带一份上一帧冗余副本，接收端使用
-小型抖动缓冲区优先恢复丢失帧，再通过插值/补偿平滑播放。
+控制面继续使用 TCP 信令，音频面使用 UDP over IP Multicast。
+接收端按发送者分路缓存，每路分别做丢包恢复、时间戳保留、
+低频噪音检测和高通滤波，最后按照主发言人优先策略混音成一路播放。
 """
 
 from __future__ import annotations
@@ -15,8 +15,9 @@ import socket
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 import sys
 
 try:
@@ -61,9 +62,17 @@ from conference_protocol import (
 )
 from multicast_audio import (
     MULTICAST_TTL,
+    HighPassFilterState,
+    NoiseMetrics,
     RedundantJitterBuffer,
+    analyze_noise,
+    frame_duration_ms,
     frame_duration_seconds,
+    has_low_frequency_noise,
+    high_pass_filter_pcm16,
+    mix_pcm16_frames,
     pack_audio_packet,
+    pcm16_rms,
     resolve_multicast_interface_ip,
     unpack_audio_packet,
 )
@@ -74,6 +83,23 @@ DEFAULT_PORT = 8882
 class RoomState:
     IDLE = "idle"
     IN_ROOM = "in_room"
+
+
+@dataclass
+class RemoteAudioStream:
+    sender_id: bytes
+    buffer: RedundantJitterBuffer
+    display_name: str
+    high_pass_state: HighPassFilterState = field(default_factory=HighPassFilterState)
+    last_seen_monotonic: float = field(default_factory=time.monotonic)
+    last_packet_timestamp_ms: int = 0
+    last_played_timestamp_ms: int = 0
+    smoothed_raw_rms: float = 0.0
+    smoothed_voice_rms: float = 0.0
+    smoothed_low_frequency_ratio: float = 0.0
+    smoothed_zero_crossing_rate: float = 0.0
+    low_frequency_noise: bool = False
+    noise_score: int = 0
 
 
 class ConferenceClient:
@@ -112,11 +138,17 @@ class ConferenceClient:
         self._is_streaming = False
 
         self._frame_bytes = CHUNK_SIZE * CHANNELS * SAMPLE_WIDTH
+        self._frame_duration_ms = frame_duration_ms(SAMPLE_RATE, CHUNK_SIZE)
+        self._frame_interval = frame_duration_seconds(SAMPLE_RATE, CHUNK_SIZE)
         self._sender_id = uuid.uuid4().bytes
         self._packet_sequence = 0
         self._previous_capture_frame: Optional[bytes] = None
-        self._playout_buffer = RedundantJitterBuffer(frame_bytes=self._frame_bytes)
-        self._frame_interval = frame_duration_seconds(SAMPLE_RATE, CHUNK_SIZE)
+        self._previous_capture_timestamp_ms: Optional[int] = None
+
+        self._audio_streams_lock = threading.RLock()
+        self._remote_audio_streams: Dict[bytes, RemoteAudioStream] = {}
+        self._audio_monitor_snapshot: Dict[str, dict] = {}
+        self._main_speaker_sender_id: Optional[bytes] = None
 
         self._response_queue: queue.Queue = queue.Queue()
         self._contacts: List[str] = []
@@ -160,6 +192,10 @@ class ConferenceClient:
     @property
     def multicast_port(self) -> int:
         return self._multicast_port
+
+    def get_audio_monitor_snapshot(self) -> Dict[str, dict]:
+        with self._audio_streams_lock:
+            return {key: dict(value) for key, value in self._audio_monitor_snapshot.items()}
 
     def _ensure_connected(self) -> bool:
         if self._sock:
@@ -267,6 +303,7 @@ class ConferenceClient:
         self._audio_protocol = "udp"
         self._multicast_group = ""
         self._multicast_port = 0
+        self._reset_remote_audio_streams()
         if self._on_room_state_change:
             self._on_room_state_change(self._room_state)
 
@@ -431,16 +468,17 @@ class ConferenceClient:
         self._multicast_interface_ip = interface_ip
         self._multicast_recv_sock = recv_sock
         self._multicast_send_sock = send_sock
-        self._playout_buffer.reset()
+        self._reset_remote_audio_streams()
         print(
             f"[Client] Multicast setup: group={multicast_group}:{multicast_port}, "
             f"iface={interface_ip}"
         )
 
     def _teardown_udp(self) -> None:
-        self._playout_buffer.reset()
         self._packet_sequence = 0
         self._previous_capture_frame = None
+        self._previous_capture_timestamp_ms = None
+        self._reset_remote_audio_streams()
 
         if self._multicast_recv_sock and self._multicast_group:
             membership = socket.inet_aton(self._multicast_group) + socket.inet_aton(
@@ -487,7 +525,8 @@ class ConferenceClient:
         self._is_streaming = True
         self._packet_sequence = 0
         self._previous_capture_frame = None
-        self._playout_buffer.reset()
+        self._previous_capture_timestamp_ms = None
+        self._reset_remote_audio_streams()
 
         threading.Thread(target=self._send_audio_loop, daemon=True).start()
         if self._audio_protocol == "udp" and self._multicast_recv_sock:
@@ -504,7 +543,28 @@ class ConferenceClient:
         except Exception:
             pass
         self._in_stream = None
-        self._playout_buffer.reset()
+        self._reset_remote_audio_streams()
+
+    def _reset_remote_audio_streams(self) -> None:
+        with self._audio_streams_lock:
+            self._remote_audio_streams = {}
+            self._audio_monitor_snapshot = {}
+            self._main_speaker_sender_id = None
+
+    def _get_or_create_remote_stream(self, sender_id: bytes) -> RemoteAudioStream:
+        with self._audio_streams_lock:
+            stream = self._remote_audio_streams.get(sender_id)
+            if stream is None:
+                stream = RemoteAudioStream(
+                    sender_id=sender_id,
+                    buffer=RedundantJitterBuffer(
+                        frame_bytes=self._frame_bytes,
+                        frame_duration_ms=self._frame_duration_ms,
+                    ),
+                    display_name=sender_id.hex()[:8],
+                )
+                self._remote_audio_streams[sender_id] = stream
+            return stream
 
     def _send_audio_loop(self) -> None:
         while self._is_streaming and self._room_id:
@@ -515,6 +575,7 @@ class ConferenceClient:
             if not data:
                 continue
 
+            timestamp_ms = int(time.time() * 1000)
             if (
                 self._audio_protocol == "udp"
                 and self._multicast_send_sock
@@ -525,13 +586,14 @@ class ConferenceClient:
                     packet = pack_audio_packet(
                         sender_id=self._sender_id,
                         sequence=self._packet_sequence,
-                        timestamp_ms=int(time.time() * 1000),
+                        timestamp_ms=timestamp_ms,
                         primary_payload=data,
                         redundant_sequence=(
                             self._packet_sequence - 1
                             if self._previous_capture_frame is not None
                             else None
                         ),
+                        redundant_timestamp_ms=self._previous_capture_timestamp_ms,
                         redundant_payload=self._previous_capture_frame or b"",
                     )
                     self._multicast_send_sock.sendto(
@@ -550,6 +612,7 @@ class ConferenceClient:
                     break
 
             self._previous_capture_frame = data
+            self._previous_capture_timestamp_ms = timestamp_ms
             self._packet_sequence += 1
             time.sleep(0.001)
 
@@ -568,7 +631,11 @@ class ConferenceClient:
                 continue
             if packet.sender_id == self._sender_id:
                 continue
-            self._playout_buffer.push(packet)
+
+            stream = self._get_or_create_remote_stream(packet.sender_id)
+            stream.buffer.push(packet)
+            stream.last_seen_monotonic = time.monotonic()
+            stream.last_packet_timestamp_ms = packet.timestamp_ms
 
     def _playout_audio_loop(self) -> None:
         next_deadline = time.monotonic()
@@ -578,20 +645,188 @@ class ConferenceClient:
                 time.sleep(min(0.005, next_deadline - now))
                 continue
 
-            frame = self._playout_buffer.pop()
-            if frame is None:
-                next_deadline = now + 0.01
-                continue
+            route_frames = self._collect_route_frames()
+            main_speaker = self._select_main_speaker(route_frames)
+            self._update_main_speaker(main_speaker)
 
-            if self._out_stream:
+            weighted_frames = []
+            for item in route_frames:
+                stream = item["stream"]
+                weight = self._get_mix_weight(stream, item["voice_rms"], main_speaker)
+                weighted_frames.append((item["frame"], weight))
+
+            mixed_frame = mix_pcm16_frames(weighted_frames)
+            if mixed_frame and self._out_stream:
                 try:
-                    self._out_stream.write(frame, exception_on_underflow=False)
+                    self._out_stream.write(mixed_frame, exception_on_underflow=False)
                 except Exception:
                     pass
 
+            self._prune_remote_audio_streams(now)
             next_deadline += self._frame_interval
             if next_deadline < now - self._frame_interval:
                 next_deadline = now + self._frame_interval
+
+    def _collect_route_frames(self) -> List[dict]:
+        with self._audio_streams_lock:
+            streams = list(self._remote_audio_streams.values())
+
+        route_frames: List[dict] = []
+        snapshot: Dict[str, dict] = {}
+        for stream in streams:
+            buffered_frame = stream.buffer.pop()
+            if buffered_frame is None:
+                continue
+
+            stream.last_played_timestamp_ms = buffered_frame.timestamp_ms
+            raw_frame = buffered_frame.payload
+            raw_metrics = analyze_noise(raw_frame)
+            self._update_noise_tracking(stream, raw_metrics)
+
+            processed_frame = raw_frame
+            if stream.low_frequency_noise:
+                processed_frame = high_pass_filter_pcm16(
+                    raw_frame,
+                    stream.high_pass_state,
+                    sample_rate=SAMPLE_RATE,
+                )
+
+            voice_rms = pcm16_rms(processed_frame)
+            if stream.smoothed_voice_rms == 0.0:
+                stream.smoothed_voice_rms = voice_rms
+            else:
+                stream.smoothed_voice_rms = stream.smoothed_voice_rms * 0.72 + voice_rms * 0.28
+
+            route_frames.append(
+                {
+                    "stream": stream,
+                    "frame": processed_frame,
+                    "voice_rms": voice_rms,
+                    "timestamp_ms": buffered_frame.timestamp_ms,
+                }
+            )
+            snapshot[stream.display_name] = {
+                "sender_id": stream.display_name,
+                "rms": round(stream.smoothed_raw_rms, 2),
+                "voice_rms": round(stream.smoothed_voice_rms, 2),
+                "low_frequency_ratio": round(stream.smoothed_low_frequency_ratio, 4),
+                "zero_crossing_rate": round(stream.smoothed_zero_crossing_rate, 4),
+                "noise_filtered": stream.low_frequency_noise,
+                "last_packet_timestamp_ms": stream.last_packet_timestamp_ms,
+                "last_played_timestamp_ms": stream.last_played_timestamp_ms,
+                "is_main_speaker": False,
+            }
+
+        with self._audio_streams_lock:
+            self._audio_monitor_snapshot = snapshot
+        return route_frames
+
+    def _update_noise_tracking(self, stream: RemoteAudioStream, metrics: NoiseMetrics) -> None:
+        if stream.smoothed_raw_rms == 0.0:
+            stream.smoothed_raw_rms = metrics.rms
+            stream.smoothed_low_frequency_ratio = metrics.low_frequency_ratio
+            stream.smoothed_zero_crossing_rate = metrics.zero_crossing_rate
+        else:
+            stream.smoothed_raw_rms = stream.smoothed_raw_rms * 0.74 + metrics.rms * 0.26
+            stream.smoothed_low_frequency_ratio = (
+                stream.smoothed_low_frequency_ratio * 0.72 + metrics.low_frequency_ratio * 0.28
+            )
+            stream.smoothed_zero_crossing_rate = (
+                stream.smoothed_zero_crossing_rate * 0.72 + metrics.zero_crossing_rate * 0.28
+            )
+
+        smoothed_metrics = NoiseMetrics(
+            rms=stream.smoothed_raw_rms,
+            low_frequency_ratio=stream.smoothed_low_frequency_ratio,
+            zero_crossing_rate=stream.smoothed_zero_crossing_rate,
+        )
+        noisy = has_low_frequency_noise(smoothed_metrics)
+        if noisy:
+            stream.noise_score = min(stream.noise_score + 1, 6)
+        else:
+            stream.noise_score = max(stream.noise_score - 1, 0)
+
+        previous_state = stream.low_frequency_noise
+        stream.low_frequency_noise = stream.noise_score >= 2
+        if previous_state != stream.low_frequency_noise:
+            if stream.low_frequency_noise:
+                print(f"[Audio] Low-frequency noise detected on route {stream.display_name}")
+            else:
+                print(f"[Audio] Low-frequency noise cleared on route {stream.display_name}")
+
+    def _select_main_speaker(self, route_frames: List[dict]) -> Optional[bytes]:
+        if not route_frames:
+            return None
+
+        scores: Dict[bytes, float] = {}
+        for item in route_frames:
+            stream = item["stream"]
+            score = stream.smoothed_voice_rms
+            if stream.low_frequency_noise:
+                score *= 0.88
+            if score >= 220.0:
+                scores[stream.sender_id] = score
+
+        if not scores:
+            return None
+
+        current = self._main_speaker_sender_id
+        if current in scores:
+            current_score = scores[current]
+            best_sender, best_score = max(scores.items(), key=lambda value: value[1])
+            if best_sender != current and best_score < current_score * 1.15:
+                return current
+        return max(scores.items(), key=lambda value: value[1])[0]
+
+    def _update_main_speaker(self, sender_id: Optional[bytes]) -> None:
+        if sender_id == self._main_speaker_sender_id:
+            self._mark_main_speaker(sender_id)
+            return
+        self._main_speaker_sender_id = sender_id
+        self._mark_main_speaker(sender_id)
+        if sender_id is None:
+            return
+        print(f"[Audio] Main speaker -> {sender_id.hex()[:8]}")
+
+    def _mark_main_speaker(self, sender_id: Optional[bytes]) -> None:
+        with self._audio_streams_lock:
+            for snapshot in self._audio_monitor_snapshot.values():
+                snapshot["is_main_speaker"] = snapshot["sender_id"] == (
+                    "" if sender_id is None else sender_id.hex()[:8]
+                )
+
+    def _get_mix_weight(
+        self,
+        stream: RemoteAudioStream,
+        voice_rms: float,
+        main_speaker: Optional[bytes],
+    ) -> float:
+        if main_speaker is not None and stream.sender_id == main_speaker:
+            weight = 1.0
+        elif voice_rms >= 320.0:
+            weight = 0.58
+        elif voice_rms >= 160.0:
+            weight = 0.36
+        else:
+            weight = 0.22
+
+        if stream.low_frequency_noise:
+            weight *= 0.72 if stream.sender_id != main_speaker else 0.9
+        return weight
+
+    def _prune_remote_audio_streams(self, now: float) -> None:
+        with self._audio_streams_lock:
+            stale_sender_ids = [
+                sender_id
+                for sender_id, stream in self._remote_audio_streams.items()
+                if now - stream.last_seen_monotonic > 3.0
+            ]
+            for sender_id in stale_sender_ids:
+                display_name = self._remote_audio_streams[sender_id].display_name
+                self._remote_audio_streams.pop(sender_id, None)
+                self._audio_monitor_snapshot.pop(display_name, None)
+                if self._main_speaker_sender_id == sender_id:
+                    self._main_speaker_sender_id = None
 
     def _send_raw(self, message: str) -> None:
         if not self._sock:
