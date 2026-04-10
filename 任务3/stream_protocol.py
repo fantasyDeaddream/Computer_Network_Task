@@ -1,72 +1,223 @@
 """
-任务3：实时音频流传输协议
+Task 3 signaling and UDP media protocol helpers.
 
-和任务2一次性“文件式”传输不同，这里使用小音频块（chunk）进行连续发送，
-实现近实时语音对讲。
-
-消息统一使用 JSON 文本，以换行符('\n')作为分隔。
+Control messages are newline-delimited JSON sent over TCP.
+Media packets are JSON datagrams sent over UDP.
 """
+
+from __future__ import annotations
 
 import base64
 import json
-from dataclasses import dataclass
 from typing import Literal
 
 
-MessageType = Literal["login", "text", "audio_chunk"]
+ControlMessageType = Literal[
+    "login",
+    "response",
+    "text",
+    "user_list",
+    "call_invite",
+    "call_accept",
+    "call_reject",
+    "call_hangup",
+    "call_busy",
+    "call_not_found",
+    "call_ready",
+    "transport_update",
+    "direct_path_seen",
+    "media_stop",
+]
+
+MediaPacketType = Literal["audio_frame", "media_probe"]
 
 
-@dataclass
-class LoginMessage:
-    nickname: str
-
-
-@dataclass
-class TextMessage:
-    content: str
-
-
-@dataclass
-class AudioChunkMessage:
-    stream_id: str
-    data: bytes
-
-
-def encode_login(nickname: str) -> str:
-    msg = {"type": "login", "nickname": nickname}
-    return json.dumps(msg)
-
-
-def encode_text(content: str) -> str:
-    msg = {"type": "text", "content": content}
-    return json.dumps(msg)
-
-
-def encode_audio_chunk(stream_id: str, raw: bytes) -> str:
-    if not raw:
-        raise ValueError("audio chunk is empty")
+def encode_login(
+    nickname: str,
+    media_port: int,
+    local_ip: str,
+) -> str:
     msg = {
-        "type": "audio_chunk",
-        "stream_id": stream_id,
-        "data": base64.b64encode(raw).decode("utf-8"),
+        "type": "login",
+        "nickname": nickname,
+        "media_port": media_port,
+        "local_ip": local_ip,
     }
-    return json.dumps(msg)
+    return json.dumps(msg, ensure_ascii=False)
 
 
-def decode_message(raw: str) -> tuple[MessageType, dict]:
-    """
-    解析消息，返回(type, payload)。
-    对不合法的消息抛出 ValueError。
-    """
+def encode_response(success: bool, message: str, data: dict | None = None) -> str:
+    msg = {
+        "type": "response",
+        "success": success,
+        "message": message,
+    }
+    if data:
+        msg["data"] = data
+    return json.dumps(msg, ensure_ascii=False)
+
+
+def encode_text(content: str, target: str = "") -> str:
+    msg = {"type": "text", "content": content, "target": target}
+    return json.dumps(msg, ensure_ascii=False)
+
+
+def encode_user_list(users: list[str]) -> str:
+    return json.dumps({"type": "user_list", "users": users}, ensure_ascii=False)
+
+
+def encode_call_invite(target: str) -> str:
+    return json.dumps({"type": "call_invite", "target": target}, ensure_ascii=False)
+
+
+def encode_call_accept(caller: str) -> str:
+    return json.dumps({"type": "call_accept", "caller": caller}, ensure_ascii=False)
+
+
+def encode_call_reject(caller: str, reason: str = "") -> str:
+    msg = {"type": "call_reject", "caller": caller, "reason": reason}
+    return json.dumps(msg, ensure_ascii=False)
+
+
+def encode_call_hangup(target: str) -> str:
+    return json.dumps({"type": "call_hangup", "target": target}, ensure_ascii=False)
+
+
+def encode_call_busy(target: str) -> str:
+    return json.dumps({"type": "call_busy", "target": target}, ensure_ascii=False)
+
+
+def encode_call_not_found(target: str) -> str:
+    return json.dumps({"type": "call_not_found", "target": target}, ensure_ascii=False)
+
+
+def encode_call_ready(
+    call_id: str,
+    peer: str,
+    mode: str,
+    peer_ip: str = "",
+    peer_port: int = 0,
+    relay_port: int = 0,
+    detail: str = "",
+) -> str:
+    msg = {
+        "type": "call_ready",
+        "call_id": call_id,
+        "peer": peer,
+        "mode": mode,
+        "peer_ip": peer_ip,
+        "peer_port": peer_port,
+        "relay_port": relay_port,
+        "detail": detail,
+    }
+    return json.dumps(msg, ensure_ascii=False)
+
+
+def encode_transport_update(
+    call_id: str,
+    peer: str,
+    mode: str,
+    detail: str = "",
+) -> str:
+    msg = {
+        "type": "transport_update",
+        "call_id": call_id,
+        "peer": peer,
+        "mode": mode,
+        "detail": detail,
+    }
+    return json.dumps(msg, ensure_ascii=False)
+
+
+def encode_direct_path_seen(call_id: str, target: str) -> str:
+    msg = {
+        "type": "direct_path_seen",
+        "call_id": call_id,
+        "target": target,
+    }
+    return json.dumps(msg, ensure_ascii=False)
+
+
+def encode_media_stop(target: str) -> str:
+    return json.dumps({"type": "media_stop", "target": target}, ensure_ascii=False)
+
+
+def encode_audio_frame(
+    stream_id: str,
+    sequence: int,
+    timestamp_ms: int,
+    sender: str,
+    target: str,
+    mode: str,
+    raw: bytes,
+) -> str:
     if not raw:
-        raise ValueError("empty message")
+        raise ValueError("audio frame is empty")
+    msg = {
+        "kind": "audio_frame",
+        "stream_id": stream_id,
+        "sequence": sequence,
+        "timestamp_ms": timestamp_ms,
+        "sender": sender,
+        "target": target,
+        "mode": mode,
+        "data": base64.b64encode(raw).decode("ascii"),
+    }
+    return json.dumps(msg, ensure_ascii=False)
+
+
+def encode_media_probe(sender: str, target: str, call_id: str, mode: str) -> str:
+    msg = {
+        "kind": "media_probe",
+        "sender": sender,
+        "target": target,
+        "call_id": call_id,
+        "mode": mode,
+    }
+    return json.dumps(msg, ensure_ascii=False)
+
+
+def decode_message(raw: str) -> tuple[str, dict]:
+    if not raw:
+        raise ValueError("empty control message")
     try:
         obj = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"invalid json: {e}") from e
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid control json: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError("control message is not an object")
+    msg_type = obj.get("type")
+    valid_types = {
+        "login",
+        "response",
+        "text",
+        "user_list",
+        "call_invite",
+        "call_accept",
+        "call_reject",
+        "call_hangup",
+        "call_busy",
+        "call_not_found",
+        "call_ready",
+        "transport_update",
+        "direct_path_seen",
+        "media_stop",
+    }
+    if msg_type not in valid_types:
+        raise ValueError(f"unknown control type: {msg_type}")
+    return msg_type, obj
 
-    t = obj.get("type")
-    if t not in ("login", "text", "audio_chunk"):
-        raise ValueError(f"unknown type: {t}")
-    return t, obj
 
+def decode_media_packet(raw: bytes) -> tuple[str, dict]:
+    if not raw:
+        raise ValueError("empty media packet")
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid media json: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError("media packet is not an object")
+    packet_type = obj.get("kind")
+    if packet_type not in {"audio_frame", "media_probe"}:
+        raise ValueError(f"unknown media kind: {packet_type}")
+    return packet_type, obj
