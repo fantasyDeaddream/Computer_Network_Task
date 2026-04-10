@@ -539,7 +539,7 @@ class ConferenceServer:
                         minfo = self._clients.get(mcid)
                         if minfo and minfo.udp_addr:
                             try:
-                                udp_sock.sendto(audio_data, minfo.udp_addr)
+                                udp_sock.sendto(data, minfo.udp_addr)
                             except Exception:
                                 pass
 

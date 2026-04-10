@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import queue
 import socket
+import struct
 import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 import sys
@@ -94,6 +97,14 @@ class ConferenceClient:
         self._in_stream = None
         self._is_streaming = False
         self._recv_thread_started = False
+
+        # 音频混音与滤波
+        self._incoming_audio: Dict[str, deque[bytes]] = {}
+        self._incoming_audio_lock = threading.Lock()
+        self._playback_thread: Optional[threading.Thread] = None
+        self._playback_active = False
+        self._sender_volumes: Dict[str, float] = {}
+        self._lowpass_state: Dict[str, float] = {}
 
         # UDP音频相关
         self._udp_sock: Optional[socket.socket] = None
@@ -412,9 +423,11 @@ class ConferenceClient:
         # UDP模式下启动UDP接收线程
         if self._audio_protocol == "udp" and self._udp_sock:
             threading.Thread(target=self._udp_recv_audio_loop, daemon=True).start()
+        self._start_playback_thread()
 
     def _stop_audio(self):
         self._is_streaming = False
+        self._playback_active = False
         time.sleep(0.1)
         try:
             if self._in_stream:
@@ -423,6 +436,9 @@ class ConferenceClient:
         except Exception:
             pass
         self._in_stream = None
+        with self._incoming_audio_lock:
+            self._incoming_audio.clear()
+            self._lowpass_state.clear()
 
     def _send_audio_loop(self):
         while self._is_streaming and self._room_id:
@@ -470,7 +486,13 @@ class ConferenceClient:
                 break
             if data and self._out_stream:
                 try:
-                    self._out_stream.write(data, exception_on_underflow=False)
+                    if len(data) >= 32:
+                        sender = data[:32].rstrip(b"\x00").decode("utf-8", errors="ignore")
+                        audio_data = data[32:]
+                        if audio_data:
+                            self._enqueue_received_audio(sender, audio_data)
+                    else:
+                        self._out_stream.write(data, exception_on_underflow=False)
                 except Exception:
                     pass
 
@@ -562,10 +584,116 @@ class ConferenceClient:
                 self._on_room_dismissed(room_id)
 
         elif mtype == "room_audio_chunk":
+            sender = payload.get("sender", "")
             b64 = payload.get("data", "")
             try:
                 raw = base64.b64decode(b64)
-                if self._out_stream:
-                    self._out_stream.write(raw, exception_on_underflow=False)
+                if sender and raw:
+                    self._enqueue_received_audio(sender, raw)
             except Exception:
                 pass
+
+    def set_sender_volume(self, sender: str, volume: float) -> None:
+        with self._incoming_audio_lock:
+            self._sender_volumes[sender] = max(0.0, min(volume, 2.0))
+
+    def _enqueue_received_audio(self, sender: str, raw: bytes) -> None:
+        if not raw:
+            return
+        filtered = self._apply_noise_lowpass(sender, raw)
+        with self._incoming_audio_lock:
+            queue = self._incoming_audio.setdefault(sender, deque())
+            if len(queue) > 50:
+                queue.popleft()
+            queue.append(filtered)
+
+    def _apply_noise_lowpass(self, sender: str, raw: bytes) -> bytes:
+        if len(raw) < 2:
+            return raw
+        sample_count = len(raw) // 2
+        try:
+            samples = list(struct.unpack(f"<{sample_count}h", raw))
+        except Exception:
+            return raw
+
+        rms = math.sqrt(sum(s * s for s in samples) / sample_count)
+        cutoff = 2800 if rms < 300 else 6500
+        prev = self._lowpass_state.get(sender, 0.0)
+        dt = 1.0 / SAMPLE_RATE
+        rc = 1.0 / (2 * math.pi * cutoff)
+        alpha = dt / (rc + dt)
+
+        volume = self._sender_volumes.get(sender, 1.0)
+        filtered = []
+        for sample in samples:
+            prev += alpha * (sample - prev)
+            scaled = int(round(prev * volume))
+            if scaled > 32767:
+                scaled = 32767
+            elif scaled < -32768:
+                scaled = -32768
+            filtered.append(scaled)
+
+        self._lowpass_state[sender] = prev
+        try:
+            return struct.pack(f"<{len(filtered)}h", *filtered)
+        except Exception:
+            return raw
+
+    def _start_playback_thread(self) -> None:
+        if self._playback_thread and self._playback_thread.is_alive():
+            return
+        self._playback_active = True
+        self._playback_thread = threading.Thread(
+            target=self._playback_loop, daemon=True
+        )
+        self._playback_thread.start()
+
+    def _playback_loop(self) -> None:
+        silence = b"\x00" * (CHUNK_SIZE * 2)
+        while self._playback_active and self._out_stream:
+            chunk = self._mix_next_chunk()
+            if chunk:
+                try:
+                    self._out_stream.write(chunk, exception_on_underflow=False)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._out_stream.write(silence, exception_on_underflow=False)
+                except Exception:
+                    pass
+                time.sleep(0.01)
+
+    def _mix_next_chunk(self) -> Optional[bytes]:
+        with self._incoming_audio_lock:
+            if not self._incoming_audio:
+                return None
+            active_chunks = []
+            for sender, queue in list(self._incoming_audio.items()):
+                if queue:
+                    chunk = queue.popleft()
+                    try:
+                        samples = struct.unpack(f"<{len(chunk) // 2}h", chunk)
+                    except Exception:
+                        samples = None
+                    if samples:
+                        active_chunks.append(samples)
+            if not active_chunks:
+                return None
+
+        max_len = max(len(samples) for samples in active_chunks)
+        mixed = [0] * max_len
+        for samples in active_chunks:
+            for idx, sample in enumerate(samples):
+                mixed[idx] += sample
+
+        max_val = max(abs(value) for value in mixed) or 1
+        if max_val > 32767:
+            scale = 32767.0 / max_val
+            mixed = [int(round(value * scale)) for value in mixed]
+
+        try:
+            return struct.pack(f"<{len(mixed)}h", *mixed)
+        except Exception:
+            return None

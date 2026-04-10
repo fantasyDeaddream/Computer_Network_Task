@@ -487,6 +487,7 @@ class ChatRoomFrame(ttk.Frame):
         self._members = {}  # position -> username
         self._avatar_widgets = {}  # position -> (canvas, label)
         self._avatar_images = {}  # position -> PhotoImage (prevent GC)
+        self._volume_controls: dict[str, tuple[tk.DoubleVar, ttk.Scale]] = {}
         self._build_ui()
 
         # 注册回调
@@ -584,6 +585,14 @@ class ChatRoomFrame(ttk.Frame):
             inner.columnconfigure(c, weight=1)
         for r in range(self.ROWS):
             inner.rowconfigure(r, weight=1)
+
+        # 音量调节区域
+        volume_box = ttk.Labelframe(self, text="音量调节", padding=10)
+        volume_box.pack(fill="x", padx=10, pady=5)
+        self._volume_box = ttk.Frame(volume_box)
+        self._volume_box.pack(fill="x")
+        ttk.Label(self._volume_box, text="成员", width=12).grid(row=0, column=0, sticky="w")
+        ttk.Label(self._volume_box, text="音量", width=30).grid(row=0, column=1, sticky="w")
 
         # 底部状态栏
         status_bar = ttk.Frame(self)
@@ -762,7 +771,17 @@ class ChatRoomFrame(ttk.Frame):
             )
             label.config(text="空位", foreground="#aaaaaa")
 
+        # 清空音量控制项
+        for var, slider in self._volume_controls.values():
+            slider.destroy()
+        self._volume_controls.clear()
+        for widget in self._volume_box.winfo_children():
+            widget.destroy()
+        ttk.Label(self._volume_box, text="成员", width=12).grid(row=0, column=0, sticky="w")
+        ttk.Label(self._volume_box, text="音量", width=30).grid(row=0, column=1, sticky="w")
+
         # 填充成员
+        volume_row = 1
         for m in members:
             uname = m["username"]
             pos = m["position"]
@@ -789,8 +808,32 @@ class ChatRoomFrame(ttk.Frame):
             display_name = uname if len(uname) <= 8 else uname[:7] + ".."
             label.config(text=display_name, foreground="#333333")
 
+            if uname != self._client.username:
+                volume_var = tk.DoubleVar(value=1.0)
+                slider = ttk.Scale(
+                    self._volume_box,
+                    variable=volume_var,
+                    from_=0.0,
+                    to=2.0,
+                    orient="horizontal",
+                    command=lambda val, name=uname: self._on_volume_change(name, val),
+                )
+                ttk.Label(self._volume_box, text=display_name, width=12).grid(
+                    row=volume_row, column=0, sticky="w", pady=2
+                )
+                slider.grid(row=volume_row, column=1, sticky="we", padx=(0, 10), pady=2)
+                self._volume_controls[uname] = (volume_var, slider)
+                volume_row += 1
+
         count = len(members)
         self._member_count_label.config(text=f"成员: {count}/{MAX_ROOM_SIZE}")
+
+    def _on_volume_change(self, username: str, value: str):
+        try:
+            volume = float(value)
+        except (TypeError, ValueError):
+            return
+        self._client.set_sender_volume(username, volume)
 
     def _on_dismissed(self, room_id):
         """聊天室被解散"""
