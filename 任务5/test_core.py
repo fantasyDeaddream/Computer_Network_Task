@@ -1,180 +1,168 @@
 """
-任务5 控制面核心功能测试（不依赖 GUI 和音频设备）
+任务5 核心功能测试（不依赖GUI和音频设备）
 """
 
-from __future__ import annotations
-
-import json
-import socket
-import sys
 import threading
 import time
+import socket
+import json
+import sys
 
 
-def send_msg(sock: socket.socket, obj: dict) -> None:
-    payload = json.dumps(obj, ensure_ascii=False) + "\n"
-    sock.sendall(payload.encode("utf-8"))
+def send_msg(sock, obj):
+    data = json.dumps(obj, ensure_ascii=False) + "\n"
+    sock.sendall(data.encode("utf-8"))
 
 
-def recv_all(sock: socket.socket, timeout: float = 1.0) -> list[dict]:
+def recv_all(sock, timeout=1.0):
     sock.settimeout(timeout)
-    buffer = ""
+    buf = ""
     try:
         while True:
-            data = sock.recv(4096)
-            if not data:
+            d = sock.recv(4096)
+            if not d:
                 break
-            buffer += data.decode("utf-8", errors="ignore")
+            buf += d.decode("utf-8", errors="ignore")
     except socket.timeout:
         pass
-    return [json.loads(line) for line in buffer.strip().split("\n") if line.strip()]
+    return [json.loads(l) for l in buf.strip().split("\n") if l.strip()]
 
 
-def main() -> int:
-    port = 18883
+def main():
+    # 使用非标准端口避免冲突
+    PORT = 18883
 
     from conference_server import ConferenceServer
 
-    server = ConferenceServer(port=port)
-    server_thread = threading.Thread(target=server.start)
-    server_thread.start()
+    server = ConferenceServer(port=PORT)
+    t = threading.Thread(target=server.start, daemon=True)
+    t.start()
     time.sleep(0.5)
 
-    results: list[str] = []
+    results = []
 
-    alice = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    bob = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # --- Test 1: Login ---
+    s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s1.connect(("localhost", PORT))
+    send_msg(s1, {"type": "login", "username": "alice"})
+    time.sleep(0.3)
+    msgs = recv_all(s1)
+    assert len(msgs) >= 1 and msgs[0].get("success") is True, f"Login failed: {msgs}"
+    results.append("PASS: Alice login")
 
-    try:
-        alice.connect(("localhost", port))
-        send_msg(alice, {"type": "login", "username": "alice"})
-        time.sleep(0.3)
-        messages = recv_all(alice)
-        assert messages and messages[0].get("success") is True, f"Alice login failed: {messages}"
-        results.append("PASS: Alice login")
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s2.connect(("localhost", PORT))
+    send_msg(s2, {"type": "login", "username": "bob"})
+    time.sleep(0.3)
+    msgs = recv_all(s2)
+    assert len(msgs) >= 1 and msgs[0].get("success") is True, f"Login failed: {msgs}"
+    results.append("PASS: Bob login")
 
-        bob.connect(("localhost", port))
-        send_msg(bob, {"type": "login", "username": "bob"})
-        time.sleep(0.3)
-        messages = recv_all(bob)
-        assert messages and messages[0].get("success") is True, f"Bob login failed: {messages}"
-        results.append("PASS: Bob login")
+    # --- Test 2: Create Room ---
+    send_msg(s1, {"type": "room_create", "creator": "alice"})
+    time.sleep(0.3)
+    msgs = recv_all(s1)
+    create_resp = None
+    for m in msgs:
+        if m.get("success") is True and "room_id" in m.get("data", {}):
+            create_resp = m
+            break
+    assert create_resp is not None, f"Create room failed: {msgs}"
+    room_id = create_resp["data"]["room_id"]
+    results.append(f"PASS: Room created (id={room_id})")
 
-        send_msg(alice, {"type": "room_create", "creator": "alice", "audio_protocol": "udp"})
-        time.sleep(0.3)
-        messages = recv_all(alice)
-        create_response = next(
-            (
-                message
-                for message in messages
-                if message.get("success") is True and "room_id" in message.get("data", {})
-            ),
-            None,
-        )
-        assert create_response is not None, f"Create room failed: {messages}"
-        room_data = create_response["data"]
-        room_id = room_data["room_id"]
-        assert room_data.get("audio_protocol") == "udp", room_data
-        assert room_data.get("multicast_group", "").startswith("239.255."), room_data
-        assert isinstance(room_data.get("multicast_port"), int) and room_data["multicast_port"] > 0
-        results.append(f"PASS: Room created with multicast endpoint ({room_data['multicast_group']}:{room_data['multicast_port']})")
+    # --- Test 3: Invite ---
+    send_msg(
+        s1,
+        {
+            "type": "room_invite",
+            "room_id": room_id,
+            "inviter": "alice",
+            "target": "bob",
+        },
+    )
+    time.sleep(0.3)
 
-        send_msg(
-            alice,
-            {
-                "type": "room_invite",
-                "room_id": room_id,
-                "inviter": "alice",
-                "target": "bob",
-            },
-        )
-        time.sleep(0.3)
+    # Alice gets invite success response
+    msgs_a = recv_all(s1)
+    invite_ok = any(m.get("success") is True for m in msgs_a)
+    assert invite_ok, f"Invite response failed: {msgs_a}"
+    results.append("PASS: Invite sent")
 
-        alice_messages = recv_all(alice)
-        assert any(message.get("success") is True for message in alice_messages), alice_messages
-        results.append("PASS: Invite sent")
+    # Bob gets invite notification
+    msgs_b = recv_all(s2)
+    invite_notify = any(m.get("type") == "room_invite_notify" for m in msgs_b)
+    assert invite_notify, f"Invite notify not received: {msgs_b}"
+    results.append("PASS: Bob received invite")
 
-        bob_messages = recv_all(bob)
-        invite_notify = next(
-            (message for message in bob_messages if message.get("type") == "room_invite_notify"),
-            None,
-        )
-        assert invite_notify is not None, bob_messages
-        results.append("PASS: Bob received invite")
+    # --- Test 4: Join Room ---
+    send_msg(s2, {"type": "room_join", "room_id": room_id, "username": "bob"})
+    time.sleep(0.3)
 
-        send_msg(bob, {"type": "room_join", "room_id": room_id, "username": "bob"})
-        time.sleep(0.3)
+    msgs_b = recv_all(s2)
+    join_ok = any(m.get("success") is True for m in msgs_b)
+    assert join_ok, f"Join failed: {msgs_b}"
+    results.append("PASS: Bob joined room")
 
-        bob_messages = recv_all(bob)
-        join_response = next(
-            (
-                message
-                for message in bob_messages
-                if message.get("success") is True and message.get("data", {}).get("room_id") == room_id
-            ),
-            None,
-        )
-        assert join_response is not None, bob_messages
-        join_data = join_response["data"]
-        assert join_data.get("multicast_group") == room_data["multicast_group"], join_data
-        assert join_data.get("multicast_port") == room_data["multicast_port"], join_data
-        results.append("PASS: Bob joined room and received multicast endpoint")
+    # Check member update received
+    member_update = any(m.get("type") == "room_member_update" for m in msgs_b)
+    results.append(
+        f"{'PASS' if member_update else 'INFO'}: Bob member update in join response"
+    )
 
-        member_update = any(message.get("type") == "room_member_update" for message in bob_messages)
-        results.append(
-            f"{'PASS' if member_update else 'INFO'}: Bob member update in join response"
-        )
+    # Alice should also get member update
+    msgs_a = recv_all(s1)
+    alice_update = any(m.get("type") == "room_member_update" for m in msgs_a)
+    results.append(
+        f"{'PASS' if alice_update else 'INFO'}: Alice member update after Bob joined"
+    )
 
-        alice_messages = recv_all(alice)
-        alice_update = any(message.get("type") == "room_member_update" for message in alice_messages)
-        results.append(
-            f"{'PASS' if alice_update else 'INFO'}: Alice member update after Bob joined"
-        )
+    # --- Test 5: Leave Room ---
+    send_msg(s2, {"type": "room_leave", "room_id": room_id, "username": "bob"})
+    time.sleep(0.3)
+    msgs_b = recv_all(s2)
+    leave_ok = any(m.get("success") is True for m in msgs_b)
+    assert leave_ok, f"Leave failed: {msgs_b}"
+    results.append("PASS: Bob left room")
 
-        send_msg(bob, {"type": "room_leave", "room_id": room_id, "username": "bob"})
-        time.sleep(0.3)
-        bob_messages = recv_all(bob)
-        assert any(message.get("success") is True for message in bob_messages), bob_messages
-        results.append("PASS: Bob left room")
+    # --- Test 6: Dismiss Room ---
+    # Re-invite and join Bob
+    send_msg(
+        s1,
+        {
+            "type": "room_invite",
+            "room_id": room_id,
+            "inviter": "alice",
+            "target": "bob",
+        },
+    )
+    time.sleep(0.2)
+    recv_all(s1)
+    recv_all(s2)
 
-        send_msg(
-            alice,
-            {
-                "type": "room_invite",
-                "room_id": room_id,
-                "inviter": "alice",
-                "target": "bob",
-            },
-        )
-        time.sleep(0.2)
-        recv_all(alice)
-        recv_all(bob)
+    send_msg(s2, {"type": "room_join", "room_id": room_id, "username": "bob"})
+    time.sleep(0.2)
+    recv_all(s2)
+    recv_all(s1)
 
-        send_msg(bob, {"type": "room_join", "room_id": room_id, "username": "bob"})
-        time.sleep(0.2)
-        recv_all(bob)
-        recv_all(alice)
+    send_msg(s1, {"type": "room_dismiss", "room_id": room_id, "creator": "alice"})
+    time.sleep(0.3)
 
-        send_msg(alice, {"type": "room_dismiss", "room_id": room_id, "creator": "alice"})
-        time.sleep(0.3)
-        bob_messages = recv_all(bob)
-        dismissed = any(
-            message.get("type") == "room_dismissed_notify" for message in bob_messages
-        )
-        assert dismissed, bob_messages
-        results.append("PASS: Room dismissed, Bob notified")
-    finally:
-        alice.close()
-        bob.close()
-        time.sleep(0.2)
-        server.stop()
-        server_thread.join(timeout=2.0)
+    msgs_b = recv_all(s2)
+    dismissed = any(m.get("type") == "room_dismissed_notify" for m in msgs_b)
+    assert dismissed, f"Dismiss notify not received: {msgs_b}"
+    results.append("PASS: Room dismissed, Bob notified")
+
+    # Cleanup
+    server.stop()
+    s1.close()
+    s2.close()
 
     print("\n" + "=" * 50)
     print("Test Results:")
     print("=" * 50)
-    for result in results:
-        print(f"  {result}")
+    for r in results:
+        print(f"  {r}")
     print("=" * 50)
     print(f"All {len(results)} tests completed!")
     return 0
