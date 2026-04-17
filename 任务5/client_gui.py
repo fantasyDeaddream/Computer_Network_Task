@@ -488,17 +488,20 @@ class ChatRoomFrame(ttk.Frame):
         self._avatar_widgets = {}  # position -> (canvas, label)
         self._avatar_images = {}  # position -> PhotoImage (prevent GC)
         self._volume_controls: dict[str, tuple[tk.DoubleVar, ttk.Scale]] = {}
+        self._quality_reports: dict[str, dict] = {}
         self._build_ui()
 
         # 注册回调
         self._client._on_room_member_update = self._on_member_update
         self._client._on_room_dismissed = self._on_dismissed
+        self._client._on_quality_update = self._on_quality_update
 
         # 从客户端缓存中立即刷新成员显示（解决加入时成员更新消息先于回调注册的问题）
         if self._client._cached_members:
             self._refresh_members(
                 self._client._cached_members, self._client._cached_positions
             )
+        self._render_quality_reports(self._client.get_quality_reports())
 
     def _build_ui(self):
         # 顶部信息栏
@@ -593,6 +596,12 @@ class ChatRoomFrame(ttk.Frame):
         self._volume_box.pack(fill="x")
         ttk.Label(self._volume_box, text="成员", width=12).grid(row=0, column=0, sticky="w")
         ttk.Label(self._volume_box, text="音量", width=30).grid(row=0, column=1, sticky="w")
+
+        # E-model通话质量
+        quality_box = ttk.Labelframe(self, text="通话质量 (E-model / G.107)", padding=10)
+        quality_box.pack(fill="x", padx=10, pady=5)
+        self._quality_box = ttk.Frame(quality_box)
+        self._quality_box.pack(fill="x")
 
         # 底部状态栏
         status_bar = ttk.Frame(self)
@@ -827,6 +836,7 @@ class ChatRoomFrame(ttk.Frame):
 
         count = len(members)
         self._member_count_label.config(text=f"成员: {count}/{MAX_ROOM_SIZE}")
+        self._render_quality_reports(self._client.get_quality_reports())
 
     def _on_volume_change(self, username: str, value: str):
         try:
@@ -835,6 +845,59 @@ class ChatRoomFrame(ttk.Frame):
             return
         self._client.set_sender_volume(username, volume)
 
+    def _on_quality_update(self, reports: dict[str, dict]) -> None:
+        self.after(0, lambda: self._render_quality_reports(reports))
+
+    def _render_quality_reports(self, reports: dict[str, dict]) -> None:
+        self._quality_reports = reports
+        for widget in self._quality_box.winfo_children():
+            widget.destroy()
+
+        headers = ("成员", "R值", "MOS", "时延", "抖动", "丢包", "等级")
+        widths = (12, 8, 8, 10, 10, 10, 10)
+        for col, (header, width) in enumerate(zip(headers, widths)):
+            ttk.Label(
+                self._quality_box, text=header, width=width, font=("微软雅黑", 9, "bold")
+            ).grid(row=0, column=col, sticky="w", padx=(0, 6))
+
+        active_reports = [
+            report
+            for sender, report in sorted(reports.items())
+            if sender != self._client.username
+        ]
+        if not active_reports:
+            ttk.Label(
+                self._quality_box,
+                text="等待接收音频数据...",
+                foreground="gray",
+            ).grid(row=1, column=0, columnspan=len(headers), sticky="w", pady=2)
+            return
+
+        for row, report in enumerate(active_reports, start=1):
+            rating = self._format_rating(report.get("rating", ""))
+            values = (
+                report.get("sender", ""),
+                f"{report.get('r_factor', 0.0):.1f}",
+                f"{report.get('mos', 0.0):.2f}",
+                f"{report.get('delay_ms', 0.0):.0f} ms",
+                f"{report.get('jitter_ms', 0.0):.0f} ms",
+                f"{report.get('packet_loss_percent', 0.0):.1f}%",
+                rating,
+            )
+            for col, (value, width) in enumerate(zip(values, widths)):
+                ttk.Label(self._quality_box, text=value, width=width).grid(
+                    row=row, column=col, sticky="w", padx=(0, 6), pady=1
+                )
+
+    def _format_rating(self, rating: str) -> str:
+        return {
+            "excellent": "优秀",
+            "good": "良好",
+            "fair": "一般",
+            "poor": "较差",
+            "bad": "很差",
+        }.get(rating, "未知")
+
     def _on_dismissed(self, room_id):
         """聊天室被解散"""
         self.after(0, lambda: self._handle_dismissed())
@@ -842,6 +905,10 @@ class ChatRoomFrame(ttk.Frame):
     def _handle_dismissed(self):
         messagebox.showinfo("聊天室已解散", "聊天室已被创建者解散")
         self._on_exit_room()
+
+    def destroy(self):
+        self._client._on_quality_update = None
+        super().destroy()
 
 
 # ============================================================

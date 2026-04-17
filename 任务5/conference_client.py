@@ -58,8 +58,11 @@ from conference_protocol import (
     encode_room_leave,
     encode_room_dismiss,
     encode_room_audio_chunk,
+    encode_udp_audio_packet,
+    decode_udp_audio_packet,
     MESSAGE_DELIMITER,
 )
+from emodel import AudioQualityMonitor
 
 DEFAULT_PORT = 8882
 
@@ -79,6 +82,7 @@ class ConferenceClient:
         on_room_invite=None,
         on_room_member_update=None,
         on_room_dismissed=None,
+        on_quality_update=None,
     ):
         self._host = host
         self._port = port
@@ -109,6 +113,9 @@ class ConferenceClient:
         # UDP音频相关
         self._udp_sock: Optional[socket.socket] = None
         self._udp_server_addr: Optional[tuple] = None  # (host, udp_port)
+        self._audio_seq = 0
+        self._quality_monitor = AudioQualityMonitor()
+        self._last_quality_callback = 0.0
 
         self._response_queue: queue.Queue = queue.Queue()
 
@@ -117,6 +124,7 @@ class ConferenceClient:
         self._on_room_invite = on_room_invite
         self._on_room_member_update = on_room_member_update
         self._on_room_dismissed = on_room_dismissed
+        self._on_quality_update = on_quality_update
 
         self._contacts: List[str] = []
 
@@ -147,6 +155,13 @@ class ConferenceClient:
     @property
     def audio_protocol(self):
         return self._audio_protocol
+
+    def get_quality_reports(self) -> Dict[str, dict]:
+        return self._quality_monitor.get_reports()
+
+    def reset_quality_stats(self) -> None:
+        self._quality_monitor.reset()
+        self._last_quality_callback = 0.0
 
     # ---- connection ----
 
@@ -229,6 +244,7 @@ class ConferenceClient:
         self._recv_thread_started = False
         self._stop_audio()
         self._teardown_udp()
+        self.reset_quality_stats()
         try:
             if self._out_stream:
                 self._out_stream.stop_stream()
@@ -245,6 +261,7 @@ class ConferenceClient:
         self._room_id = ""
         self._room_state = RoomState.IDLE
         self._audio_protocol = "tcp"
+        self._audio_seq = 0
 
     # ---- contacts ----
 
@@ -317,6 +334,8 @@ class ConferenceClient:
             self._is_creator = True
             self._room_state = RoomState.IN_ROOM
             self._audio_protocol = data.get("audio_protocol", "tcp")
+            self._audio_seq = 0
+            self.reset_quality_stats()
             if self._audio_protocol == "udp":
                 udp_port = data.get("udp_port", 0)
                 self._setup_udp(udp_port)
@@ -341,6 +360,8 @@ class ConferenceClient:
             self._is_creator = data.get("creator", "") == self._username
             self._room_state = RoomState.IN_ROOM
             self._audio_protocol = data.get("audio_protocol", "tcp")
+            self._audio_seq = 0
+            self.reset_quality_stats()
             if self._audio_protocol == "udp":
                 udp_port = data.get("udp_port", 0)
                 self._setup_udp(udp_port)
@@ -359,6 +380,8 @@ class ConferenceClient:
         self._is_creator = False
         self._my_position = -1
         self._audio_protocol = "tcp"
+        self._audio_seq = 0
+        self.reset_quality_stats()
 
     def dismiss_room(self):
         if not self._room_id:
@@ -372,6 +395,8 @@ class ConferenceClient:
         self._is_creator = False
         self._my_position = -1
         self._audio_protocol = "tcp"
+        self._audio_seq = 0
+        self.reset_quality_stats()
 
     # ---- UDP ----
 
@@ -440,6 +465,23 @@ class ConferenceClient:
             self._incoming_audio.clear()
             self._lowpass_state.clear()
 
+    def _next_audio_metadata(self) -> tuple[int, int]:
+        seq = self._audio_seq
+        self._audio_seq = (self._audio_seq + 1) & 0xFFFFFFFF
+        timestamp_ms = int(time.time() * 1000)
+        return seq, timestamp_ms
+
+    def _record_audio_quality(
+        self, sender: str, seq: Optional[int], timestamp_ms: Optional[int]
+    ) -> None:
+        if not sender:
+            return
+        self._quality_monitor.observe_packet(sender, seq, timestamp_ms)
+        now = time.time()
+        if self._on_quality_update and now - self._last_quality_callback >= 1.0:
+            self._last_quality_callback = now
+            self._on_quality_update(self.get_quality_reports())
+
     def _send_audio_loop(self):
         while self._is_streaming and self._room_id:
             try:
@@ -448,6 +490,7 @@ class ConferenceClient:
                 break
             if not data:
                 continue
+            seq, timestamp_ms = self._next_audio_metadata()
 
             if (
                 self._audio_protocol == "udp"
@@ -456,11 +499,10 @@ class ConferenceClient:
             ):
                 # UDP模式：通过UDP发送音频
                 try:
-                    # 前32字节为用户名，其余为音频数据
-                    username_bytes = self._username.encode("utf-8")[:32].ljust(
-                        32, b"\x00"
+                    packet = encode_udp_audio_packet(
+                        self._username, data, seq, timestamp_ms
                     )
-                    self._udp_sock.sendto(username_bytes + data, self._udp_server_addr)
+                    self._udp_sock.sendto(packet, self._udp_server_addr)
                 except Exception:
                     break
             else:
@@ -468,7 +510,9 @@ class ConferenceClient:
                 try:
                     if not self._sock:
                         break
-                    msg = encode_room_audio_chunk(self._room_id, self._username, data)
+                    msg = encode_room_audio_chunk(
+                        self._room_id, self._username, data, seq, timestamp_ms
+                    )
                     self._sock.sendall((msg + MESSAGE_DELIMITER).encode("utf-8"))
                 except Exception:
                     break
@@ -486,13 +530,10 @@ class ConferenceClient:
                 break
             if data and self._out_stream:
                 try:
-                    if len(data) >= 32:
-                        sender = data[:32].rstrip(b"\x00").decode("utf-8", errors="ignore")
-                        audio_data = data[32:]
-                        if audio_data:
-                            self._enqueue_received_audio(sender, audio_data)
-                    else:
-                        self._out_stream.write(data, exception_on_underflow=False)
+                    sender, seq, timestamp_ms, audio_data = decode_udp_audio_packet(data)
+                    if audio_data:
+                        self._record_audio_quality(sender, seq, timestamp_ms)
+                        self._enqueue_received_audio(sender, audio_data)
                 except Exception:
                     pass
 
@@ -580,15 +621,20 @@ class ConferenceClient:
             self._is_creator = False
             self._my_position = -1
             self._audio_protocol = "tcp"
+            self._audio_seq = 0
+            self.reset_quality_stats()
             if self._on_room_dismissed:
                 self._on_room_dismissed(room_id)
 
         elif mtype == "room_audio_chunk":
             sender = payload.get("sender", "")
             b64 = payload.get("data", "")
+            seq = payload.get("seq")
+            timestamp_ms = payload.get("timestamp_ms")
             try:
                 raw = base64.b64decode(b64)
                 if sender and raw:
+                    self._record_audio_quality(sender, seq, timestamp_ms)
                     self._enqueue_received_audio(sender, raw)
             except Exception:
                 pass

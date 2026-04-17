@@ -41,6 +41,28 @@ def main():
 
     results = []
 
+    # --- Test 0: E-model audio metadata helpers ---
+    from conference_protocol import (
+        decode_message,
+        decode_udp_audio_packet,
+        encode_room_audio_chunk,
+        encode_udp_audio_packet,
+    )
+    from emodel import evaluate_quality
+
+    encoded = encode_room_audio_chunk("r1", "alice", b"abc", seq=7, timestamp_ms=123)
+    mtype, payload = decode_message(encoded)
+    assert mtype == "room_audio_chunk"
+    assert payload["seq"] == 7 and payload["timestamp_ms"] == 123
+
+    udp_packet = encode_udp_audio_packet("alice", b"abc", seq=8, timestamp_ms=456)
+    sender, seq, timestamp_ms, raw = decode_udp_audio_packet(udp_packet)
+    assert (sender, seq, timestamp_ms, raw) == ("alice", 8, 456, b"abc")
+
+    quality = evaluate_quality(delay_ms=50, packet_loss_percent=0, jitter_ms=5)
+    assert quality.r_factor > 80 and quality.mos > 4.0
+    results.append("PASS: E-model helpers")
+
     # --- Test 1: Login ---
     s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s1.connect(("localhost", PORT))

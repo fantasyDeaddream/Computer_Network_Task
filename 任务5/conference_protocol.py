@@ -19,6 +19,8 @@
 
 import base64
 import json
+import struct
+import time
 from typing import Literal, Optional, List
 
 # 消息类型定义（包含任务4的所有类型 + 新增聊天室类型）
@@ -54,6 +56,10 @@ MessageType = Literal[
 
 MESSAGE_DELIMITER = "\n"
 MAX_ROOM_SIZE = 20  # 每个聊天室最多容纳20个用户
+UDP_AUDIO_MAGIC = b"CN5A"
+UDP_AUDIO_USERNAME_BYTES = 32
+_UDP_AUDIO_HEADER = struct.Struct("!4s32sIQ")
+UDP_AUDIO_HEADER_SIZE = _UDP_AUDIO_HEADER.size
 
 
 # ========== 聊天室消息编码函数 ==========
@@ -133,7 +139,13 @@ def encode_room_member_update(
     return json.dumps(msg, ensure_ascii=False)
 
 
-def encode_room_audio_chunk(room_id: str, sender: str, raw: bytes) -> str:
+def encode_room_audio_chunk(
+    room_id: str,
+    sender: str,
+    raw: bytes,
+    seq: Optional[int] = None,
+    timestamp_ms: Optional[int] = None,
+) -> str:
     """编码聊天室音频数据块"""
     if not raw:
         raise ValueError("audio chunk is empty")
@@ -143,7 +155,51 @@ def encode_room_audio_chunk(room_id: str, sender: str, raw: bytes) -> str:
         "sender": sender,
         "data": base64.b64encode(raw).decode("utf-8"),
     }
+    if seq is not None:
+        msg["seq"] = int(seq)
+    if timestamp_ms is not None:
+        msg["timestamp_ms"] = int(timestamp_ms)
     return json.dumps(msg)
+
+
+def encode_udp_audio_packet(
+    sender: str,
+    raw: bytes,
+    seq: int = 0,
+    timestamp_ms: Optional[int] = None,
+) -> bytes:
+    """编码UDP音频包，包含用户名、序号和发送时间。"""
+    if not raw:
+        raise ValueError("audio chunk is empty")
+    if timestamp_ms is None:
+        timestamp_ms = int(time.time() * 1000)
+    username_bytes = sender.encode("utf-8")[:UDP_AUDIO_USERNAME_BYTES].ljust(
+        UDP_AUDIO_USERNAME_BYTES, b"\x00"
+    )
+    header = _UDP_AUDIO_HEADER.pack(
+        UDP_AUDIO_MAGIC, username_bytes, int(seq) & 0xFFFFFFFF, int(timestamp_ms)
+    )
+    return header + raw
+
+
+def decode_udp_audio_packet(packet: bytes) -> tuple:
+    """解析UDP音频包，兼容旧的32字节用户名头格式。"""
+    if len(packet) >= UDP_AUDIO_HEADER_SIZE and packet[:4] == UDP_AUDIO_MAGIC:
+        _, username_bytes, seq, timestamp_ms = _UDP_AUDIO_HEADER.unpack(
+            packet[:UDP_AUDIO_HEADER_SIZE]
+        )
+        sender = username_bytes.rstrip(b"\x00").decode("utf-8", errors="ignore")
+        return sender, seq, timestamp_ms, packet[UDP_AUDIO_HEADER_SIZE:]
+
+    if len(packet) >= UDP_AUDIO_USERNAME_BYTES:
+        sender = (
+            packet[:UDP_AUDIO_USERNAME_BYTES]
+            .rstrip(b"\x00")
+            .decode("utf-8", errors="ignore")
+        )
+        return sender, None, None, packet[UDP_AUDIO_USERNAME_BYTES:]
+
+    raise ValueError("invalid udp audio packet")
 
 
 # ========== 在线状态查询 ==========

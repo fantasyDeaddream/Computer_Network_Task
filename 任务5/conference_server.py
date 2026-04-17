@@ -5,6 +5,7 @@
 """
 
 import json
+import os
 import random
 import socket
 import threading
@@ -20,6 +21,7 @@ from conference_protocol import (
     encode_room_invite_notify,
     encode_room_dismissed_notify,
     encode_room_member_update,
+    decode_udp_audio_packet,
     MAX_ROOM_SIZE,
     MESSAGE_DELIMITER,
 )
@@ -36,6 +38,42 @@ _ensure_task4_on_path()
 from data_store import get_data_store
 
 DEFAULT_PORT = 8882
+
+
+@dataclass(frozen=True)
+class NetworkImpairment:
+    delay_ms: float = 0.0
+    jitter_ms: float = 0.0
+    loss_rate: float = 0.0
+
+    @classmethod
+    def from_env(cls) -> "NetworkImpairment":
+        def read_float(name: str, default: float = 0.0) -> float:
+            try:
+                return float(os.getenv(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        delay_ms = max(0.0, read_float("TASK5_DELAY_MS"))
+        jitter_ms = max(0.0, read_float("TASK5_JITTER_MS"))
+        loss_rate = max(0.0, read_float("TASK5_LOSS_RATE"))
+        if loss_rate > 1.0:
+            loss_rate /= 100.0
+        return cls(
+            delay_ms=delay_ms,
+            jitter_ms=jitter_ms,
+            loss_rate=min(loss_rate, 1.0),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.delay_ms > 0 or self.jitter_ms > 0 or self.loss_rate > 0
+
+    def sampled_delay_seconds(self) -> float:
+        if self.delay_ms <= 0 and self.jitter_ms <= 0:
+            return 0.0
+        jitter = random.uniform(-self.jitter_ms, self.jitter_ms)
+        return max(0.0, self.delay_ms + jitter) / 1000.0
 
 
 @dataclass
@@ -89,12 +127,20 @@ class ConferenceServer:
         self._lock = threading.RLock()
         self._running = False
         self._data_store = get_data_store()
+        self._impairment = NetworkImpairment.from_env()
 
     def start(self) -> None:
         self._sock.bind((self._host, self._port))
         self._sock.listen(20)
         self._running = True
         print(f"[Server] Listening on {self._host}:{self._port}")
+        if self._impairment.enabled:
+            print(
+                "[Server] Network impairment: "
+                f"delay={self._impairment.delay_ms:.1f}ms, "
+                f"jitter={self._impairment.jitter_ms:.1f}ms, "
+                f"loss={self._impairment.loss_rate * 100:.1f}%"
+            )
         try:
             while self._running:
                 try:
@@ -153,6 +199,8 @@ class ConferenceServer:
                         continue
                     self._dispatch(cid, mtype, payload, conn, line)
         except ConnectionResetError:
+            pass
+        except OSError:
             pass
         finally:
             self._handle_disconnect(cid)
@@ -475,6 +523,7 @@ class ConferenceServer:
 
     def _forward_room_audio(self, cid, raw):
         """TCP模式下的音频转发"""
+        recipients = []
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.room_id:
@@ -487,13 +536,16 @@ class ConferenceServer:
                 if m == sender:
                     continue
                 if m in self._username_map:
-                    self._send_by_cid(self._username_map[m], raw)
+                    recipients.append(self._username_map[m])
+        for target_cid in recipients:
+            self._send_audio_by_cid(target_cid, raw)
 
     def _udp_recv_loop(self, room_id: str) -> None:
         """UDP模式下的音频接收和转发循环
 
         每个UDP聊天室有一个独立的UDP socket。
-        客户端发送的UDP数据包格式：前32字节为用户名（UTF-8，右侧补零），其余为音频数据。
+        客户端发送的UDP数据包格式由 conference_protocol 编解码，
+        包含用户名、音频序号和发送时间戳。
         服务器收到后转发给同一聊天室的其他成员。
         """
         while self._running:
@@ -511,13 +563,14 @@ class ConferenceServer:
             except OSError:
                 break
 
-            if len(data) < 32:
+            try:
+                sender, _, _, audio_data = decode_udp_audio_packet(data)
+            except ValueError:
+                continue
+            if not sender or not audio_data:
                 continue
 
-            # 解析发送者用户名（前32字节）
-            sender = data[:32].rstrip(b"\x00").decode("utf-8", errors="ignore")
-            audio_data = data[32:]
-
+            recipients = []
             with self._lock:
                 room = self._rooms.get(room_id)
                 if not room or not room._udp_sock:
@@ -538,10 +591,10 @@ class ConferenceServer:
                         mcid = self._username_map[m]
                         minfo = self._clients.get(mcid)
                         if minfo and minfo.udp_addr:
-                            try:
-                                udp_sock.sendto(data, minfo.udp_addr)
-                            except Exception:
-                                pass
+                            recipients.append(minfo.udp_addr)
+
+            for target_addr in recipients:
+                self._send_udp_audio(udp_sock, data, target_addr)
 
         print(f"[Server] UDP recv loop for room {room_id} stopped")
 
@@ -555,6 +608,43 @@ class ConferenceServer:
             room._udp_sock = None
 
     # ---- network ----
+
+    def _should_drop_audio(self) -> bool:
+        return (
+            self._impairment.loss_rate > 0
+            and random.random() < self._impairment.loss_rate
+        )
+
+    def _send_audio_by_cid(self, cid: int, msg: str) -> None:
+        if self._should_drop_audio():
+            return
+        delay = self._impairment.sampled_delay_seconds()
+        if delay <= 0:
+            self._send_by_cid(cid, msg)
+            return
+        timer = threading.Timer(delay, self._send_by_cid, args=(cid, msg))
+        timer.daemon = True
+        timer.start()
+
+    def _send_udp_audio(
+        self, udp_sock: socket.socket, data: bytes, target_addr: Tuple[str, int]
+    ) -> None:
+        if self._should_drop_audio():
+            return
+
+        def send_now() -> None:
+            try:
+                udp_sock.sendto(data, target_addr)
+            except Exception:
+                pass
+
+        delay = self._impairment.sampled_delay_seconds()
+        if delay <= 0:
+            send_now()
+            return
+        timer = threading.Timer(delay, send_now)
+        timer.daemon = True
+        timer.start()
 
     def _send(self, conn, msg):
         try:
