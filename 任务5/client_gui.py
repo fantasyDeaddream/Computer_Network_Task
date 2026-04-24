@@ -15,6 +15,7 @@ from typing import Optional
 from pathlib import Path
 import sys
 import math
+import shutil
 
 
 def _ensure_task2_on_path() -> None:
@@ -264,6 +265,102 @@ class ContactFrame(ttk.Frame):
             return
         contacts = self._client.search_contacts(kw)
         self._display_contacts(contacts)
+
+
+# ============================================================
+# AvatarSelectorFrame - 头像选择界面
+# ============================================================
+class AvatarSelectorFrame(ttk.Frame):
+
+    AVATAR_DISPLAY_SIZE = 80
+
+    def __init__(self, parent, username: str):
+        super().__init__(parent)
+        self._username = username
+        self._selected_avatar: Optional[Path] = None
+        self._avatar_buttons: dict = {}
+        self._build_ui()
+
+    def _build_ui(self):
+        title = ttk.Label(self, text="选择头像", font=("微软雅黑", 14))
+        title.pack(pady=10)
+
+        hint = ttk.Label(self, text=f"当前用户: {self._username}", foreground="gray")
+        hint.pack(pady=(0, 5))
+
+        canvas_frame = ttk.Frame(self)
+        canvas_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        canvas = tk.Canvas(canvas_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        avatars_dir = Path(__file__).resolve().parent / "data" / "avatars" / "default"
+        avatar_paths = list(avatars_dir.glob("*.png"))
+
+        cols = 5
+        for idx, avatar_path in enumerate(avatar_paths):
+            row = idx // cols
+            col = idx % cols
+
+            frame = ttk.Frame(scrollable_frame, relief="ridge", borderwidth=2)
+            frame.grid(row=row, column=col, padx=5, pady=5)
+
+            try:
+                img = tk.PhotoImage(file=str(avatar_path))
+                orig_w = img.width()
+                orig_h = img.height()
+                if orig_w > self.AVATAR_DISPLAY_SIZE or orig_h > self.AVATAR_DISPLAY_SIZE:
+                    factor = max(orig_w // self.AVATAR_DISPLAY_SIZE, orig_h // self.AVATAR_DISPLAY_SIZE)
+                    img = img.subsample(factor, factor)
+
+                label = ttk.Label(frame, image=img)
+                label.image = img
+                label.pack(padx=5, pady=5)
+
+                def on_select(path=avatar_path, f=frame):
+                    self._selected_avatar = path
+                    for btn_frame in self._avatar_buttons.values():
+                        btn_frame.config(relief="ridge")
+                    f.config(relief="solid")
+
+                label.bind("<Button-1>", lambda e, p=avatar_path, f=frame: on_select(p, f))
+                self._avatar_buttons[avatar_path] = frame
+            except Exception as e:
+                print(f"Failed to load avatar: {avatar_path}: {e}")
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="确认选择", command=self._on_confirm).pack(side="left", padx=10)
+
+        self._status_label = ttk.Label(self, text="", foreground="green")
+        self._status_label.pack(pady=5)
+
+    def _on_confirm(self):
+        if not self._selected_avatar:
+            messagebox.showwarning("未选择", "请先点击选择一个头像")
+            return
+
+        avatars_dir = Path(__file__).resolve().parent / "data" / "avatars"
+        dest_path = avatars_dir / f"{self._username}.png"
+
+        try:
+            shutil.copy2(self._selected_avatar, dest_path)
+            self._status_label.config(text=f"头像已保存: {dest_path.name}")
+            messagebox.showinfo("成功", "头像设置成功！")
+        except Exception as e:
+            messagebox.showerror("失败", f"保存头像失败: {e}")
 
 
 # ============================================================
@@ -1246,6 +1343,9 @@ class ClientGUI(ttk.Window):
             on_activate=self._activate_private_call_tab,
         )
         self._notebook.add(self._private_call_frame, text="私聊语音")
+
+        self._avatar_selector_frame = AvatarSelectorFrame(self._notebook, self._username)
+        self._notebook.add(self._avatar_selector_frame, text="头像设置")
         self._sync_feature_availability()
 
     def _enter_room(self, room_id: str):
