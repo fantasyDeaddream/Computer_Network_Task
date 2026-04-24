@@ -50,7 +50,7 @@ def main():
         encode_udp_audio_packet,
     )
     from audio_adaptive import CANONICAL_AUDIO_FORMAT
-    from emodel import evaluate_quality
+    from emodel import AudioQualityMonitor, evaluate_quality
 
     encoded = encode_room_audio_chunk(
         "r1",
@@ -77,6 +77,12 @@ def main():
 
     quality = evaluate_quality(delay_ms=50, packet_loss_percent=0, jitter_ms=5)
     assert quality.r_factor > 80 and quality.mos > 4.0
+
+    monitor = AudioQualityMonitor()
+    monitor.observe_packet("alice", 1, 100)
+    monitor.observe_packet("bob", 1, 100)
+    monitor.prune_senders({"alice"})
+    assert set(monitor.get_reports().keys()) == {"alice"}
     results.append("PASS: E-model helpers")
 
     # --- Test 1: Login ---

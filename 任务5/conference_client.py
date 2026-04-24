@@ -184,6 +184,20 @@ class ConferenceClient:
         self._last_quality_callback = 0.0
         self._last_quality_report_sent = 0.0
 
+    def prune_room_member_state(self, active_members: List[str]) -> None:
+        active = set(active_members)
+        with self._incoming_audio_lock:
+            stale = [
+                sender for sender in list(self._incoming_audio.keys()) if sender not in active
+            ]
+            for sender in stale:
+                self._incoming_audio.pop(sender, None)
+                self._lowpass_state.pop(sender, None)
+                self._volume_levels.pop(sender, None)
+                self._receive_transcoders.pop(sender, None)
+                self._sender_volumes.pop(sender, None)
+        self._quality_monitor.prune_senders(active)
+
     # ---- connection ----
 
     def _ensure_connected(self) -> bool:

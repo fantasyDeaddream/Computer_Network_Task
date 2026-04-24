@@ -785,6 +785,8 @@ class ChatRoomFrame(ttk.Frame):
         )
 
     def _refresh_members(self, members, positions):
+        active_members = [member.get("username", "") for member in members]
+        self._client.prune_room_member_state(active_members)
         # 清空所有位置
         self._members.clear()
         self._avatar_images.clear()
@@ -912,7 +914,7 @@ class ChatRoomFrame(ttk.Frame):
         active_reports = [
             report
             for sender, report in sorted(reports.items())
-            if sender != self._client.username
+            if sender != self._client.username and sender in self._members.values()
         ]
         if not active_reports:
             ttk.Label(

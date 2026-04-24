@@ -146,6 +146,14 @@ class AudioQualityMonitor:
         with self._lock:
             self._states.clear()
 
+    def prune_senders(self, active_senders: set[str]) -> None:
+        with self._lock:
+            stale = [
+                sender for sender in self._states.keys() if sender not in active_senders
+            ]
+            for sender in stale:
+                self._states.pop(sender, None)
+
     def observe_packet(
         self,
         sender: str,
