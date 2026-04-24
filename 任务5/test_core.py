@@ -43,7 +43,9 @@ def main():
 
     # --- Test 0: E-model audio metadata helpers ---
     from conference_protocol import (
+        decode_media_packet,
         decode_message,
+        encode_audio_frame,
         decode_udp_audio_packet,
         encode_room_audio_chunk,
         encode_quality_report,
@@ -86,9 +88,24 @@ def main():
     results.append("PASS: E-model helpers")
 
     # --- Test 1: Login ---
+    udp_a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_a.bind(("127.0.0.1", 0))
+    udp_b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_b.bind(("127.0.0.1", 0))
+    udp_a.settimeout(1.0)
+    udp_b.settimeout(1.0)
+
     s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s1.connect(("localhost", PORT))
-    send_msg(s1, {"type": "login", "username": "alice"})
+    send_msg(
+        s1,
+        {
+            "type": "login",
+            "username": "alice",
+            "media_port": udp_a.getsockname()[1],
+            "local_ip": "127.0.0.1",
+        },
+    )
     time.sleep(0.3)
     msgs = recv_all(s1)
     assert len(msgs) >= 1 and msgs[0].get("success") is True, f"Login failed: {msgs}"
@@ -96,13 +113,100 @@ def main():
 
     s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s2.connect(("localhost", PORT))
-    send_msg(s2, {"type": "login", "username": "bob"})
+    send_msg(
+        s2,
+        {
+            "type": "login",
+            "username": "bob",
+            "media_port": udp_b.getsockname()[1],
+            "local_ip": "127.0.0.1",
+        },
+    )
     time.sleep(0.3)
     msgs = recv_all(s2)
     assert len(msgs) >= 1 and msgs[0].get("success") is True, f"Login failed: {msgs}"
     results.append("PASS: Bob login")
 
-    # --- Test 2: Create Room ---
+    # --- Test 2: Private call signaling + relay/P2P switching ---
+    send_msg(s1, {"type": "call_invite", "target": "bob"})
+    time.sleep(0.2)
+    msgs_b = recv_all(s2, timeout=0.2)
+    assert any(
+        m.get("type") == "call_invite" and m.get("caller") == "alice" for m in msgs_b
+    ), f"Call invite not received: {msgs_b}"
+    results.append("PASS: Private call invite delivered")
+
+    send_msg(s2, {"type": "call_accept", "caller": "alice"})
+    time.sleep(0.3)
+    msgs_a = recv_all(s1, timeout=0.2)
+    msgs_b = recv_all(s2, timeout=0.2)
+    ready_a = next((m for m in msgs_a if m.get("type") == "call_ready"), None)
+    ready_b = next((m for m in msgs_b if m.get("type") == "call_ready"), None)
+    assert ready_a and ready_b, f"Call ready missing: {msgs_a} / {msgs_b}"
+    assert ready_a.get("mode") == "negotiating", ready_a
+    assert ready_b.get("mode") == "negotiating", ready_b
+    call_id = ready_a["call_id"]
+    results.append("PASS: Private call negotiation started")
+
+    relay_packet = encode_audio_frame(
+        stream_id="stream-a",
+        sequence=1,
+        timestamp_ms=100,
+        sender="alice",
+        target="bob",
+        mode="negotiating",
+        raw=b"\x01\x02" * 320,
+    )
+    udp_a.sendto(relay_packet, ("127.0.0.1", PORT))
+    data, _addr = udp_b.recvfrom(65535)
+    packet_type, media_payload = decode_media_packet(data)
+    assert packet_type == "audio_frame", media_payload
+    assert media_payload.get("sender") == "alice", media_payload
+    results.append("PASS: Private call relay forwarding works during negotiation")
+
+    send_msg(s1, {"type": "direct_path_seen", "call_id": call_id, "target": "bob"})
+    send_msg(s2, {"type": "direct_path_seen", "call_id": call_id, "target": "alice"})
+    time.sleep(0.3)
+    msgs_a = recv_all(s1, timeout=0.2)
+    msgs_b = recv_all(s2, timeout=0.2)
+    assert any(
+        m.get("type") == "transport_update" and m.get("mode") == "p2p" for m in msgs_a
+    ), msgs_a
+    assert any(
+        m.get("type") == "transport_update" and m.get("mode") == "p2p" for m in msgs_b
+    ), msgs_b
+    results.append("PASS: Private call switched to P2P")
+
+    send_msg(s1, {"type": "call_hangup", "target": "bob"})
+    time.sleep(0.2)
+    recv_all(s1, timeout=0.2)
+    recv_all(s2, timeout=0.2)
+
+    send_msg(s1, {"type": "call_invite", "target": "bob"})
+    time.sleep(0.2)
+    recv_all(s2, timeout=0.2)
+    send_msg(s2, {"type": "call_accept", "caller": "alice"})
+    time.sleep(0.3)
+    msgs_a = recv_all(s1, timeout=0.2)
+    ready_a = next((m for m in msgs_a if m.get("type") == "call_ready"), None)
+    assert ready_a, msgs_a
+    time.sleep(2.0)
+    msgs_a = recv_all(s1, timeout=0.2)
+    msgs_b = recv_all(s2, timeout=0.2)
+    assert any(
+        m.get("type") == "transport_update" and m.get("mode") == "relay" for m in msgs_a
+    ), msgs_a
+    assert any(
+        m.get("type") == "transport_update" and m.get("mode") == "relay" for m in msgs_b
+    ), msgs_b
+    results.append("PASS: Private call falls back to relay after negotiation timeout")
+
+    send_msg(s1, {"type": "call_hangup", "target": "bob"})
+    time.sleep(0.2)
+    recv_all(s1, timeout=0.2)
+    recv_all(s2, timeout=0.2)
+
+    # --- Test 3: Create Room ---
     send_msg(s1, {"type": "room_create", "creator": "alice"})
     time.sleep(0.3)
     msgs = recv_all(s1)
@@ -115,7 +219,7 @@ def main():
     room_id = create_resp["data"]["room_id"]
     results.append(f"PASS: Room created (id={room_id})")
 
-    # --- Test 3: Invite ---
+    # --- Test 4: Invite ---
     send_msg(
         s1,
         {
@@ -139,7 +243,7 @@ def main():
     assert invite_notify, f"Invite notify not received: {msgs_b}"
     results.append("PASS: Bob received invite")
 
-    # --- Test 4: Join Room ---
+    # --- Test 5: Join Room ---
     send_msg(s2, {"type": "room_join", "room_id": room_id, "username": "bob"})
     time.sleep(0.3)
 
@@ -161,7 +265,7 @@ def main():
         f"{'PASS' if alice_update else 'INFO'}: Alice member update after Bob joined"
     )
 
-    # --- Test 5: Adaptive downstream audio ---
+    # --- Test 6: Adaptive downstream audio ---
     send_msg(
         s2,
         json.loads(
@@ -206,7 +310,7 @@ def main():
     assert adaptive_chunks[0].get("profile") == "resilient", adaptive_chunks[0]
     results.append("PASS: Adaptive downstream audio profile applied")
 
-    # --- Test 6: Leave Room ---
+    # --- Test 7: Leave Room ---
     send_msg(s2, {"type": "room_leave", "room_id": room_id, "username": "bob"})
     time.sleep(0.3)
     msgs_b = recv_all(s2)
@@ -214,7 +318,7 @@ def main():
     assert leave_ok, f"Leave failed: {msgs_b}"
     results.append("PASS: Bob left room")
 
-    # --- Test 7: Dismiss Room ---
+    # --- Test 8: Dismiss Room ---
     # Re-invite and join Bob
     send_msg(
         s1,
@@ -246,6 +350,8 @@ def main():
     server.stop()
     s1.close()
     s2.close()
+    udp_a.close()
+    udp_b.close()
 
     print("\n" + "=" * 50)
     print("Test Results:")

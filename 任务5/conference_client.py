@@ -15,7 +15,9 @@ import struct
 import threading
 import time
 import uuid
+from array import array
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 import sys
@@ -50,6 +52,8 @@ from audio_adaptive import (
 )
 
 from conference_protocol import (
+    decode_media_packet,
+    encode_audio_frame,
     encode_login,
     encode_logout,
     encode_contact_add,
@@ -57,6 +61,13 @@ from conference_protocol import (
     encode_contact_update,
     encode_contact_list,
     encode_contact_search,
+    encode_call_accept,
+    encode_call_hangup,
+    encode_call_invite,
+    encode_call_reject,
+    encode_direct_path_seen,
+    encode_media_probe,
+    encode_media_stop,
     encode_online_query,
     encode_room_create,
     encode_room_invite,
@@ -72,11 +83,35 @@ from conference_protocol import (
 from emodel import AudioQualityMonitor
 
 DEFAULT_PORT = 8882
+CALL_MEDIA_CHUNK_SIZE = 320
+CALL_FRAME_DURATION_SEC = CALL_MEDIA_CHUNK_SIZE / float(SAMPLE_RATE)
+CALL_PLAYBACK_DELAY_SEC = CALL_FRAME_DURATION_SEC * 3
+CALL_MISSING_GRACE_SEC = CALL_FRAME_DURATION_SEC * 0.75
+MAX_CALL_JITTER_BUFFER_FRAMES = 64
+NEGOTIATION_PROBE_INTERVAL_SEC = 0.20
 
 
 class RoomState:
     IDLE = "idle"
     IN_ROOM = "in_room"
+
+
+class CallState:
+    IDLE = "idle"
+    CALLING = "calling"
+    RINGING = "ringing"
+    CONNECTING = "connecting"
+    IN_CALL = "in_call"
+    ENDED = "ended"
+
+
+@dataclass
+class MediaFrame:
+    sequence: int
+    timestamp_ms: int
+    stream_id: str
+    payload: bytes
+    received_at: float
 
 
 class ConferenceClient:
@@ -90,12 +125,15 @@ class ConferenceClient:
         on_room_member_update=None,
         on_room_dismissed=None,
         on_quality_update=None,
+        on_call_state_change=None,
     ):
         self._host = host
         self._port = port
         self._sock: Optional[socket.socket] = None
         self._running = False
         self._username = ""
+        self._server_ip = ""
+        self._local_ip = ""
 
         self._room_id = ""
         self._room_state = RoomState.IDLE
@@ -133,12 +171,38 @@ class ConferenceClient:
         self._response_queue: queue.Queue = queue.Queue()
         self._send_lock = threading.Lock()
 
+        self._call_media_sock: Optional[socket.socket] = None
+        self._call_media_port = 0
+        self._call_media_thread: Optional[threading.Thread] = None
+        self._call_playback_thread: Optional[threading.Thread] = None
+        self._call_send_thread: Optional[threading.Thread] = None
+        self._call_probe_thread: Optional[threading.Thread] = None
+        self._call_probe_stop = threading.Event()
+        self._call_sending = False
+        self._call_in_stream = None
+        self._call_state = CallState.IDLE
+        self._in_call_with = ""
+        self._call_id = ""
+        self._session_mode = ""
+        self._peer_media_addr: Optional[tuple[str, int]] = None
+        self._relay_media_addr: Optional[tuple[str, int]] = None
+        self._call_stream_id = uuid.uuid4().hex
+        self._first_packet_path_logged = False
+        self._direct_path_reported = False
+        self._call_jitter_lock = threading.Lock()
+        self._call_jitter_buffer: Dict[int, MediaFrame] = {}
+        self._call_expected_sequence: Optional[int] = None
+        self._call_next_play_time = 0.0
+        self._call_remote_stream_id = ""
+        self._call_last_played_frame: Optional[bytes] = None
+
         # callbacks
         self._on_room_state_change = on_room_state_change
         self._on_room_invite = on_room_invite
         self._on_room_member_update = on_room_member_update
         self._on_room_dismissed = on_room_dismissed
         self._on_quality_update = on_quality_update
+        self._on_call_state_change = on_call_state_change
 
         self._contacts: List[str] = []
 
@@ -170,6 +234,22 @@ class ConferenceClient:
     def audio_protocol(self):
         return self._audio_protocol
 
+    @property
+    def call_state(self) -> str:
+        return self._call_state
+
+    @property
+    def in_call_with(self) -> str:
+        return self._in_call_with
+
+    @property
+    def session_mode(self) -> str:
+        return self._session_mode
+
+    @property
+    def is_call_sending(self) -> bool:
+        return self._call_sending
+
     def get_quality_reports(self) -> Dict[str, dict]:
         return self._quality_monitor.get_reports()
 
@@ -197,6 +277,66 @@ class ConferenceClient:
                 self._receive_transcoders.pop(sender, None)
                 self._sender_volumes.pop(sender, None)
         self._quality_monitor.prune_senders(active)
+
+    def _set_call_state(self, state: str, peer: str) -> None:
+        self._call_state = state
+        if state in (CallState.IDLE, CallState.ENDED):
+            self._call_sending = False
+        if self._on_call_state_change:
+            self._on_call_state_change(state, peer)
+
+    def _emit_call_state(self) -> None:
+        if self._on_call_state_change:
+            self._on_call_state_change(self._call_state, self._in_call_with)
+
+    def _reset_call_jitter_buffer(self) -> None:
+        with self._call_jitter_lock:
+            self._call_jitter_buffer.clear()
+            self._call_expected_sequence = None
+            self._call_next_play_time = 0.0
+            self._call_remote_stream_id = ""
+            self._call_last_played_frame = None
+
+    def _setup_private_call_media(self) -> None:
+        self._teardown_private_call_media()
+        if not self._sock:
+            return
+        try:
+            self._server_ip = self._sock.getpeername()[0]
+            self._local_ip = self._sock.getsockname()[0]
+            self._call_media_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._call_media_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._call_media_sock.settimeout(0.3)
+            bind_host = self._local_ip if self._local_ip else ""
+            self._call_media_sock.bind((bind_host, 0))
+            self._call_media_port = int(self._call_media_sock.getsockname()[1])
+        except Exception as exc:
+            print(f"[Client] Private call UDP setup failed: {exc}")
+            self._call_media_sock = None
+            self._call_media_port = 0
+
+    def _teardown_private_call_media(self) -> None:
+        if self._call_media_sock:
+            try:
+                self._call_media_sock.close()
+            except Exception:
+                pass
+        self._call_media_sock = None
+        self._call_media_port = 0
+
+    def _start_private_call_threads(self) -> None:
+        if self._call_media_sock and (
+            not self._call_media_thread or not self._call_media_thread.is_alive()
+        ):
+            self._call_media_thread = threading.Thread(
+                target=self._recv_call_media_loop, daemon=True
+            )
+            self._call_media_thread.start()
+        if not self._call_playback_thread or not self._call_playback_thread.is_alive():
+            self._call_playback_thread = threading.Thread(
+                target=self._private_call_playback_loop, daemon=True
+            )
+            self._call_playback_thread.start()
 
     # ---- connection ----
 
@@ -226,7 +366,10 @@ class ConferenceClient:
             return False, "用户名不能为空"
         if not self._ensure_connected():
             return False, "无法连接到服务器"
-        self._send_raw(encode_login(username))
+        self._setup_private_call_media()
+        self._send_raw(
+            encode_login(username, self._call_media_port, self._local_ip)
+        )
         success, message = self._sync_wait_response()
         if success:
             self._username = username
@@ -242,6 +385,9 @@ class ConferenceClient:
                 except Exception as e:
                     print(f"[Client] Open output device failed: {e}")
             self._start_recv_thread()
+            self._start_private_call_threads()
+        else:
+            self._teardown_private_call_media()
         return success, message
 
     def _sync_wait_response(self, timeout=5.0):
@@ -277,6 +423,12 @@ class ConferenceClient:
         self._running = False
         self._is_streaming = False
         self._recv_thread_started = False
+        if self._sock and self._in_call_with:
+            try:
+                self._send_raw(encode_call_hangup(self._in_call_with))
+            except Exception:
+                pass
+        self._clear_private_call_session(reset_state=True)
         self._stop_audio()
         self._teardown_udp()
         self.reset_quality_stats()
@@ -293,12 +445,14 @@ class ConferenceClient:
         except Exception:
             pass
         self._sock = None
+        self._teardown_private_call_media()
         self._room_id = ""
         self._room_state = RoomState.IDLE
         self._audio_protocol = "tcp"
         self._audio_seq = 0
         self._active_receive_format = CANONICAL_AUDIO_FORMAT
         self._active_receive_profile = "wideband"
+        self._set_call_state(CallState.IDLE, "")
 
     # ---- contacts ----
 
@@ -354,6 +508,57 @@ class ConferenceClient:
             return data.get("online_users", [])
         return []
 
+    # ---- private call ----
+
+    def call(self, target: str) -> tuple[bool, str]:
+        target = target.strip()
+        if not target:
+            return False, "请输入要呼叫的用户名"
+        if self._room_state == RoomState.IN_ROOM:
+            return False, "请先退出聊天室"
+        if not self._call_media_sock or self._call_media_port <= 0:
+            return False, "当前客户端未准备好私聊语音 UDP 通道"
+        if self._call_state not in (CallState.IDLE, CallState.ENDED):
+            return False, "当前已有私聊语音会话"
+        self._in_call_with = target
+        self._set_call_state(CallState.CALLING, target)
+        self._send_raw(encode_call_invite(target))
+        return True, "呼叫已发送"
+
+    def accept_call(self, caller: str = "") -> tuple[bool, str]:
+        target = caller.strip() or self._in_call_with
+        if not target:
+            return False, "没有待接听的来电"
+        if self._room_state == RoomState.IN_ROOM:
+            return False, "请先退出聊天室"
+        if self._call_state != CallState.RINGING:
+            return False, "当前没有待接听的来电"
+        self._in_call_with = target
+        self._set_call_state(CallState.CONNECTING, target)
+        self._send_raw(encode_call_accept(target))
+        return True, "正在建立连接"
+
+    def reject_call(self, caller: str = "") -> tuple[bool, str]:
+        target = caller.strip() or self._in_call_with
+        if not target:
+            return False, "没有待拒绝的来电"
+        self._send_raw(encode_call_reject(target, "Call rejected"))
+        self._clear_private_call_session(reset_state=True)
+        self._set_call_state(CallState.IDLE, "")
+        return True, "已拒绝来电"
+
+    def hangup_call(self) -> tuple[bool, str]:
+        peer = self._in_call_with
+        if self._sock and peer:
+            try:
+                self._send_raw(encode_call_hangup(peer))
+            except Exception:
+                pass
+        self._clear_private_call_session(reset_state=True)
+        self._set_call_state(CallState.ENDED, "")
+        threading.Timer(1.0, lambda: self._set_call_state(CallState.IDLE, "")).start()
+        return True, "通话已结束"
+
     # ---- room ----
 
     def create_room(self, audio_protocol: str = "tcp"):
@@ -362,6 +567,8 @@ class ConferenceClient:
         Args:
             audio_protocol: 音频传输协议，"tcp" 或 "udp"
         """
+        if self._call_state not in (CallState.IDLE, CallState.ENDED):
+            return False, "请先结束当前私聊语音", {}
         ok, msg, data = self._request_response(
             encode_room_create(self._username, audio_protocol)
         )
@@ -392,6 +599,8 @@ class ConferenceClient:
         return ok, msg
 
     def join_room(self, room_id):
+        if self._call_state not in (CallState.IDLE, CallState.ENDED):
+            return False, "请先结束当前私聊语音", {}
         ok, msg, data = self._request_response(
             encode_room_join(room_id, self._username)
         )
@@ -650,6 +859,367 @@ class ConferenceClient:
                 except Exception:
                     pass
 
+    # ---- private call audio ----
+
+    def _start_call_streaming(self) -> None:
+        if self._call_state != CallState.IN_CALL:
+            return
+        if self._call_sending or not self._p or not self._call_media_sock:
+            return
+        try:
+            self._call_in_stream = self._p.open(
+                format=AUDIO_FORMAT,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                input=True,
+                frames_per_buffer=CALL_MEDIA_CHUNK_SIZE,
+            )
+        except Exception as exc:
+            print(f"[Client] Open private-call microphone failed: {exc}")
+            return
+        self._call_sending = True
+        self._call_stream_id = uuid.uuid4().hex
+        self._call_send_thread = threading.Thread(
+            target=self._send_call_audio_loop, daemon=True
+        )
+        self._call_send_thread.start()
+        self._emit_call_state()
+
+    def _stop_call_streaming(self, notify_peer: bool = True) -> None:
+        was_sending = self._call_sending
+        self._call_sending = False
+        try:
+            if self._call_in_stream:
+                self._call_in_stream.stop_stream()
+                self._call_in_stream.close()
+        except Exception:
+            pass
+        self._call_in_stream = None
+        if notify_peer and was_sending and self._sock and self._in_call_with:
+            try:
+                self._send_raw(encode_media_stop(self._in_call_with))
+            except Exception:
+                pass
+        self._emit_call_state()
+
+    def _send_call_audio_loop(self) -> None:
+        if not self._call_in_stream or not self._call_media_sock:
+            self._call_sending = False
+            return
+
+        sequence = 0
+        started_at = time.monotonic()
+        while self._call_sending and self._call_media_sock:
+            destinations = self._resolve_call_destinations()
+            if not destinations:
+                time.sleep(0.02)
+                continue
+            try:
+                payload = self._call_in_stream.read(
+                    CALL_MEDIA_CHUNK_SIZE, exception_on_overflow=False
+                )
+            except Exception:
+                break
+            if not payload:
+                continue
+            try:
+                packet = encode_audio_frame(
+                    stream_id=self._call_stream_id,
+                    sequence=sequence,
+                    timestamp_ms=int((time.monotonic() - started_at) * 1000),
+                    sender=self._username,
+                    target=self._in_call_with,
+                    mode=self._session_mode or "negotiating",
+                    raw=payload,
+                )
+                for destination in destinations:
+                    self._call_media_sock.sendto(packet, destination)
+                sequence += 1
+            except Exception:
+                break
+            time.sleep(0.0005)
+
+        self._call_sending = False
+        self._emit_call_state()
+
+    def _recv_call_media_loop(self) -> None:
+        while self._running and self._call_media_sock:
+            try:
+                data, addr = self._call_media_sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            try:
+                packet_type, payload = decode_media_packet(data)
+            except ValueError:
+                continue
+
+            if packet_type == "media_probe":
+                sender = str(payload.get("sender", "")).strip()
+                if sender and sender == self._in_call_with:
+                    if self._classify_source_path(addr) == "direct":
+                        self._report_direct_path_seen()
+                continue
+
+            self._handle_call_audio_packet(payload, addr)
+
+    def _private_call_playback_loop(self) -> None:
+        while True:
+            if not self._running and not self._call_media_sock:
+                break
+            if not self._running or not self._out_stream:
+                time.sleep(0.05)
+                continue
+
+            with self._call_jitter_lock:
+                expected = self._call_expected_sequence
+                next_play_time = self._call_next_play_time
+                has_frames = bool(self._call_jitter_buffer)
+
+            if expected is None or (not has_frames and self._call_state != CallState.IN_CALL):
+                time.sleep(0.01)
+                continue
+
+            now = time.monotonic()
+            if next_play_time and now < next_play_time:
+                time.sleep(min(next_play_time - now, 0.01))
+                continue
+
+            raw = self._dequeue_call_audio_frame()
+            if raw is None:
+                time.sleep(0.005)
+                continue
+            try:
+                self._out_stream.write(raw, exception_on_underflow=False)
+            except Exception:
+                pass
+
+    def _dequeue_call_audio_frame(self) -> Optional[bytes]:
+        with self._call_jitter_lock:
+            if self._call_expected_sequence is None:
+                return None
+
+            frame = self._call_jitter_buffer.pop(self._call_expected_sequence, None)
+            now = time.monotonic()
+            if frame is None:
+                min_seq = min(self._call_jitter_buffer) if self._call_jitter_buffer else None
+                if min_seq is None and now < self._call_next_play_time + CALL_MISSING_GRACE_SEC:
+                    return None
+                if min_seq is not None and min_seq > self._call_expected_sequence:
+                    raw = self._conceal_missing_call_frame_locked()
+                else:
+                    if now < self._call_next_play_time + CALL_MISSING_GRACE_SEC:
+                        return None
+                    raw = self._conceal_missing_call_frame_locked()
+            else:
+                raw = frame.payload
+
+            self._call_last_played_frame = raw
+            self._call_expected_sequence += 1
+            if self._call_next_play_time == 0.0:
+                self._call_next_play_time = now + CALL_FRAME_DURATION_SEC
+            else:
+                self._call_next_play_time = max(
+                    self._call_next_play_time + CALL_FRAME_DURATION_SEC, now
+                )
+            return raw
+
+    def _handle_call_audio_packet(self, payload: dict, addr: tuple[str, int]) -> None:
+        sender = str(payload.get("sender", "")).strip()
+        if not sender or sender != self._in_call_with:
+            return
+
+        source_path = self._classify_source_path(addr)
+        if self._session_mode == "p2p" and source_path == "relay":
+            return
+        if self._session_mode == "relay" and source_path == "direct":
+            return
+        if source_path == "direct":
+            self._report_direct_path_seen()
+
+        try:
+            sequence = int(payload.get("sequence", 0))
+            timestamp_ms = int(payload.get("timestamp_ms", 0))
+            stream_id = str(payload.get("stream_id", "")).strip()
+            raw = base64.b64decode(str(payload.get("data", "")))
+        except Exception:
+            return
+        if not raw:
+            return
+
+        with self._call_jitter_lock:
+            if stream_id != self._call_remote_stream_id:
+                self._call_remote_stream_id = stream_id
+                self._call_jitter_buffer.clear()
+                self._call_expected_sequence = None
+                self._call_last_played_frame = None
+                self._call_next_play_time = 0.0
+
+            if (
+                self._call_expected_sequence is not None
+                and sequence < self._call_expected_sequence - 2
+            ):
+                return
+            if sequence in self._call_jitter_buffer:
+                return
+
+            self._call_jitter_buffer[sequence] = MediaFrame(
+                sequence=sequence,
+                timestamp_ms=timestamp_ms,
+                stream_id=stream_id,
+                payload=raw,
+                received_at=time.monotonic(),
+            )
+            if self._call_expected_sequence is None:
+                self._call_expected_sequence = sequence
+                self._call_next_play_time = time.monotonic() + CALL_PLAYBACK_DELAY_SEC
+
+            if len(self._call_jitter_buffer) > MAX_CALL_JITTER_BUFFER_FRAMES:
+                for old_seq in sorted(self._call_jitter_buffer)[
+                    :-MAX_CALL_JITTER_BUFFER_FRAMES
+                ]:
+                    self._call_jitter_buffer.pop(old_seq, None)
+
+    def _resolve_call_destinations(self) -> List[tuple[str, int]]:
+        destinations: List[tuple[str, int]] = []
+        if self._session_mode == "negotiating":
+            if self._peer_media_addr:
+                destinations.append(self._peer_media_addr)
+            if self._relay_media_addr:
+                destinations.append(self._relay_media_addr)
+        elif self._session_mode == "p2p" and self._peer_media_addr:
+            destinations.append(self._peer_media_addr)
+        elif self._session_mode == "relay" and self._relay_media_addr:
+            destinations.append(self._relay_media_addr)
+        elif self._peer_media_addr:
+            destinations.append(self._peer_media_addr)
+        elif self._relay_media_addr:
+            destinations.append(self._relay_media_addr)
+
+        deduped: List[tuple[str, int]] = []
+        seen = set()
+        for item in destinations:
+            if item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        return deduped
+
+    def _classify_source_path(self, addr: tuple[str, int]) -> str:
+        if self._peer_media_addr and addr == self._peer_media_addr:
+            return "direct"
+        if self._relay_media_addr and addr == self._relay_media_addr:
+            return "relay"
+        return "unknown"
+
+    def _start_call_probe_thread(self) -> None:
+        self._stop_call_probe_thread()
+        self._call_probe_stop.clear()
+        self._call_probe_thread = threading.Thread(
+            target=self._call_probe_loop, daemon=True
+        )
+        self._call_probe_thread.start()
+
+    def _stop_call_probe_thread(self) -> None:
+        self._call_probe_stop.set()
+
+    def _call_probe_loop(self) -> None:
+        while (
+            self._running
+            and not self._call_probe_stop.is_set()
+            and self._call_state == CallState.IN_CALL
+            and self._session_mode == "negotiating"
+        ):
+            self._send_direct_probe()
+            time.sleep(NEGOTIATION_PROBE_INTERVAL_SEC)
+
+    def _send_direct_probe(self) -> None:
+        if not self._peer_media_addr or not self._call_media_sock or not self._call_id:
+            return
+        try:
+            self._call_media_sock.sendto(
+                encode_media_probe(
+                    self._username,
+                    self._in_call_with,
+                    self._call_id,
+                    self._session_mode or "negotiating",
+                ),
+                self._peer_media_addr,
+            )
+        except Exception:
+            pass
+
+    def _report_direct_path_seen(self) -> None:
+        if not self._call_id or not self._sock or not self._in_call_with:
+            return
+        if self._direct_path_reported:
+            return
+        self._direct_path_reported = True
+        try:
+            self._send_raw(encode_direct_path_seen(self._call_id, self._in_call_with))
+        except Exception:
+            self._direct_path_reported = False
+
+    def _clear_private_call_session(self, reset_state: bool) -> None:
+        self._stop_call_streaming(notify_peer=False)
+        self._stop_call_probe_thread()
+        self._call_id = ""
+        self._session_mode = ""
+        self._peer_media_addr = None
+        self._relay_media_addr = None
+        self._first_packet_path_logged = False
+        self._direct_path_reported = False
+        self._reset_call_jitter_buffer()
+        if reset_state:
+            self._in_call_with = ""
+
+    def _conceal_missing_call_frame_locked(self) -> bytes:
+        next_frame = None
+        if self._call_jitter_buffer:
+            next_frame = self._call_jitter_buffer.get(min(self._call_jitter_buffer))
+        if self._call_last_played_frame and next_frame:
+            return self._interpolate_frames(
+                self._call_last_played_frame, next_frame.payload
+            )
+        if self._call_last_played_frame:
+            return self._attenuate_frame(self._call_last_played_frame, 0.92)
+        if next_frame:
+            return next_frame.payload
+        return bytes(CALL_MEDIA_CHUNK_SIZE * 2)
+
+    def _interpolate_frames(self, left: bytes, right: bytes) -> bytes:
+        left_samples = self._bytes_to_samples(left)
+        right_samples = self._bytes_to_samples(right)
+        size = min(len(left_samples), len(right_samples))
+        mixed = array("h")
+        for idx in range(size):
+            mixed.append(int((left_samples[idx] + right_samples[idx]) / 2))
+        return self._samples_to_bytes(mixed)
+
+    def _attenuate_frame(self, raw: bytes, factor: float) -> bytes:
+        samples = self._bytes_to_samples(raw)
+        adjusted = array("h")
+        for sample in samples:
+            adjusted.append(self._clip_sample(int(sample * factor)))
+        return self._samples_to_bytes(adjusted)
+
+    def _bytes_to_samples(self, raw: bytes) -> array:
+        samples = array("h")
+        samples.frombytes(raw)
+        if sys.byteorder != "little":
+            samples.byteswap()
+        return samples
+
+    def _samples_to_bytes(self, samples: array) -> bytes:
+        converted = array("h", samples)
+        if sys.byteorder != "little":
+            converted.byteswap()
+        return converted.tobytes()
+
+    def _clip_sample(self, value: int) -> int:
+        return max(-32768, min(32767, value))
+
     # ---- network ----
 
     def _send_raw(self, msg):
@@ -693,7 +1263,19 @@ class ConferenceClient:
         self._recv_thread_started = False
 
     def _handle_message(self, mtype, payload):
-        if mtype == "room_invite_notify":
+        if mtype in {
+            "call_invite",
+            "call_ready",
+            "transport_update",
+            "call_reject",
+            "call_busy",
+            "call_not_found",
+            "call_hangup",
+            "media_stop",
+        }:
+            self._handle_call_message(mtype, payload)
+
+        elif mtype == "room_invite_notify":
             room_id = payload.get("room_id", "")
             inviter = payload.get("inviter", "")
             if self._on_room_invite:
@@ -762,6 +1344,68 @@ class ConferenceClient:
                     self._enqueue_received_audio(sender, raw, receive_format)
             except Exception:
                 pass
+
+    def _handle_call_message(self, mtype: str, payload: dict) -> None:
+        if mtype == "call_invite":
+            caller = str(payload.get("caller", "")).strip()
+            if not caller:
+                return
+            self._in_call_with = caller
+            self._set_call_state(CallState.RINGING, caller)
+            return
+
+        if mtype == "call_ready":
+            peer = str(payload.get("peer", "")).strip()
+            relay_port = int(payload.get("relay_port", self._port) or self._port)
+            peer_ip = str(payload.get("peer_ip", "")).strip()
+            peer_port = int(payload.get("peer_port", 0) or 0)
+            self._in_call_with = peer
+            self._call_id = str(payload.get("call_id", "")).strip()
+            self._session_mode = str(payload.get("mode", "")).strip() or "negotiating"
+            self._peer_media_addr = (peer_ip, peer_port) if peer_ip and peer_port else None
+            self._relay_media_addr = (self._server_ip or self._host, relay_port)
+            self._direct_path_reported = False
+            self._reset_call_jitter_buffer()
+            self._start_call_probe_thread()
+            self._set_call_state(CallState.IN_CALL, peer)
+            self._start_call_streaming()
+            return
+
+        if mtype == "transport_update":
+            call_id = str(payload.get("call_id", "")).strip()
+            if call_id and self._call_id and call_id != self._call_id:
+                return
+            self._session_mode = str(payload.get("mode", "")).strip()
+            self._stop_call_probe_thread()
+            self._emit_call_state()
+            return
+
+        if mtype == "call_reject":
+            self._clear_private_call_session(reset_state=True)
+            self._set_call_state(CallState.ENDED, "")
+            threading.Timer(1.0, lambda: self._set_call_state(CallState.IDLE, "")).start()
+            return
+
+        if mtype == "call_busy":
+            self._clear_private_call_session(reset_state=True)
+            self._set_call_state(CallState.ENDED, "")
+            threading.Timer(1.0, lambda: self._set_call_state(CallState.IDLE, "")).start()
+            return
+
+        if mtype == "call_not_found":
+            self._clear_private_call_session(reset_state=True)
+            self._set_call_state(CallState.ENDED, "")
+            threading.Timer(1.0, lambda: self._set_call_state(CallState.IDLE, "")).start()
+            return
+
+        if mtype == "call_hangup":
+            self._clear_private_call_session(reset_state=True)
+            self._set_call_state(CallState.ENDED, "")
+            threading.Timer(1.0, lambda: self._set_call_state(CallState.IDLE, "")).start()
+            return
+
+        if mtype == "media_stop":
+            self._reset_call_jitter_buffer()
 
     def set_sender_volume(self, sender: str, volume: float) -> None:
         with self._incoming_audio_lock:

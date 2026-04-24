@@ -470,6 +470,224 @@ class TelephoneFrame(ttk.Frame):
 # ChatRoomFrame - 聊天室界面
 # 20个用户位置，纯白头像，邀请/退出/解散功能
 # ============================================================
+class PrivateCallFrame(ttk.Frame):
+
+    _ONLINE_PREFIX = "在线 "
+    _OFFLINE_PREFIX = "离线 "
+
+    def __init__(
+        self,
+        parent,
+        client: ConferenceClient,
+        on_state_change=None,
+        on_activate=None,
+    ):
+        super().__init__(parent)
+        self._client = client
+        self._on_state_change = on_state_change
+        self._on_activate = on_activate
+        self._build_ui()
+        self._client._on_call_state_change = self._on_call_state_change
+        self._refresh_candidates()
+        self._render_call_state()
+
+    def _build_ui(self):
+        title = ttk.Label(self, text="私聊语音", font=("微软雅黑", 14))
+        title.pack(pady=10)
+
+        status_box = ttk.Labelframe(self, text="当前状态", padding=10)
+        status_box.pack(fill="x", padx=10, pady=5)
+        self._status_var = tk.StringVar(value="空闲")
+        self._peer_var = tk.StringVar(value="对端: -")
+        self._route_var = tk.StringVar(value="链路: -")
+        ttk.Label(status_box, textvariable=self._status_var, font=("微软雅黑", 12)).pack(
+            anchor="w"
+        )
+        ttk.Label(status_box, textvariable=self._peer_var, foreground="gray").pack(
+            anchor="w", pady=(4, 0)
+        )
+        ttk.Label(status_box, textvariable=self._route_var, foreground="gray").pack(
+            anchor="w", pady=(2, 0)
+        )
+
+        target_box = ttk.Labelframe(self, text="呼叫目标", padding=10)
+        target_box.pack(fill="x", padx=10, pady=5)
+        ttk.Label(target_box, text="用户名").grid(row=0, column=0, sticky="w")
+        self._target_var = tk.StringVar()
+        target_entry = ttk.Entry(target_box, textvariable=self._target_var, width=28)
+        target_entry.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        target_entry.bind("<Return>", lambda _event: self._on_call())
+        ttk.Button(target_box, text="刷新联系人", command=self._refresh_candidates).grid(
+            row=0, column=2, sticky="w", padx=(12, 0)
+        )
+
+        action_box = ttk.Frame(target_box)
+        action_box.grid(row=1, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self._btn_call = ttk.Button(action_box, text="呼叫", command=self._on_call)
+        self._btn_call.pack(side="left", padx=4)
+        self._btn_accept = ttk.Button(
+            action_box, text="接听", command=self._on_accept, state="disabled"
+        )
+        self._btn_accept.pack(side="left", padx=4)
+        self._btn_reject = ttk.Button(
+            action_box, text="拒绝", command=self._on_reject, state="disabled"
+        )
+        self._btn_reject.pack(side="left", padx=4)
+        self._btn_hangup = ttk.Button(
+            action_box, text="挂断", command=self._on_hangup, state="disabled"
+        )
+        self._btn_hangup.pack(side="left", padx=4)
+
+        ttk.Label(
+            target_box,
+            text="建立通话后会自动采集麦克风，并优先尝试 P2P 直连，失败则自动切换到服务器中转。",
+            foreground="gray",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        list_box = ttk.Labelframe(self, text="联系人 / 在线情况", padding=10)
+        list_box.pack(fill="both", expand=True, padx=10, pady=5)
+        self._candidate_list = tk.Listbox(list_box, height=12)
+        self._candidate_list.pack(side="left", fill="both", expand=True)
+        self._candidate_list.bind("<<ListboxSelect>>", lambda _event: self._use_selection())
+        self._candidate_list.bind("<Double-Button-1>", lambda _event: self._on_call())
+        scrollbar = ttk.Scrollbar(
+            list_box, orient="vertical", command=self._candidate_list.yview
+        )
+        scrollbar.pack(side="right", fill="y")
+        self._candidate_list.config(yscrollcommand=scrollbar.set)
+
+    def _use_selection(self):
+        selection = self._candidate_list.curselection()
+        if not selection:
+            return
+        raw = self._candidate_list.get(selection[0])
+        for prefix in (self._ONLINE_PREFIX, self._OFFLINE_PREFIX):
+            if raw.startswith(prefix):
+                self._target_var.set(raw[len(prefix) :])
+                return
+        self._target_var.set(raw)
+
+    def _refresh_candidates(self):
+        def load():
+            contacts = self._client.get_contacts()
+            online = set(self._client.get_online_users())
+            values = []
+            for name in contacts:
+                prefix = self._ONLINE_PREFIX if name in online else self._OFFLINE_PREFIX
+                values.append(f"{prefix}{name}")
+            self.after(0, lambda: self._fill_candidates(values))
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def _fill_candidates(self, values):
+        self._candidate_list.delete(0, tk.END)
+        for value in values:
+            self._candidate_list.insert(tk.END, value)
+
+    def _on_call(self):
+        target = self._target_var.get().strip()
+        ok, msg = self._client.call(target)
+        if not ok:
+            messagebox.showwarning("无法呼叫", msg)
+            return
+        self._render_call_state()
+
+    def _on_accept(self):
+        ok, msg = self._client.accept_call(self._target_var.get().strip())
+        if not ok:
+            messagebox.showwarning("无法接听", msg)
+            return
+        self._render_call_state()
+
+    def _on_reject(self):
+        ok, msg = self._client.reject_call(self._target_var.get().strip())
+        if not ok:
+            messagebox.showwarning("无法拒绝", msg)
+            return
+        self._render_call_state()
+
+    def _on_hangup(self):
+        self._client.hangup_call()
+        self._render_call_state()
+
+    def _on_call_state_change(self, _state, _peer):
+        self.after(0, self._render_call_state)
+        if self._on_state_change:
+            self.after(0, self._on_state_change)
+        if self._client.call_state == "ringing" and self._on_activate:
+            self.after(0, self._on_activate)
+
+    def _render_call_state(self):
+        state = self._client.call_state
+        peer = self._client.in_call_with or "-"
+        mode_map = {
+            "negotiating": "协商中（先尝试 P2P）",
+            "p2p": "P2P 直连",
+            "relay": "服务器中转",
+            "": "-",
+        }
+        state_map = {
+            "idle": "空闲",
+            "calling": "呼叫中",
+            "ringing": "来电中",
+            "connecting": "连接中",
+            "in_call": "通话中",
+            "ended": "已结束",
+        }
+        if peer != "-" and state in {"ringing", "calling", "connecting", "in_call"}:
+            self._target_var.set(peer)
+        route_text = mode_map.get(self._client.session_mode, self._client.session_mode or "-")
+        if self._client.is_call_sending and state == "in_call":
+            route_text = f"{route_text} | 麦克风发送中"
+
+        self._status_var.set(state_map.get(state, state))
+        self._peer_var.set(f"对端: {peer}")
+        self._route_var.set(f"链路: {route_text}")
+        self.refresh_availability()
+
+    def refresh_availability(self):
+        in_room = self._client.room_state == RoomState.IN_ROOM
+        state = self._client.call_state
+        can_call = not in_room and state in {"idle", "ended"}
+        can_accept = not in_room and state == "ringing"
+        can_reject = not in_room and state == "ringing"
+        can_hangup = state in {"calling", "connecting", "in_call"}
+        self._btn_call.config(state="normal" if can_call else "disabled")
+        self._btn_accept.config(state="normal" if can_accept else "disabled")
+        self._btn_reject.config(state="normal" if can_reject else "disabled")
+        self._btn_hangup.config(state="normal" if can_hangup else "disabled")
+        if in_room:
+            self._status_var.set("聊天室中，私聊语音不可用")
+            self._route_var.set("链路: 请先退出聊天室")
+        else:
+            mode_map = {
+                "negotiating": "协商中（先尝试 P2P）",
+                "p2p": "P2P 直连",
+                "relay": "服务器中转",
+                "": "-",
+            }
+            state_map = {
+                "idle": "空闲",
+                "calling": "呼叫中",
+                "ringing": "来电中",
+                "connecting": "连接中",
+                "in_call": "通话中",
+                "ended": "已结束",
+            }
+            route_text = mode_map.get(
+                self._client.session_mode, self._client.session_mode or "-"
+            )
+            if self._client.is_call_sending and state == "in_call":
+                route_text = f"{route_text} | 麦克风发送中"
+            self._status_var.set(state_map.get(state, state))
+            self._route_var.set(f"链路: {route_text}")
+
+    def destroy(self):
+        if self._client._on_call_state_change == self._on_call_state_change:
+            self._client._on_call_state_change = None
+        super().destroy()
+
+
 class ChatRoomFrame(ttk.Frame):
 
     AVATAR_SIZE = 80
@@ -989,6 +1207,7 @@ class ClientGUI(ttk.Window):
         self._main_frame: Optional[ttk.Frame] = None
         self._notebook: Optional[ttk.Notebook] = None
         self._chatroom_frame: Optional[ChatRoomFrame] = None
+        self._private_call_frame: Optional[PrivateCallFrame] = None
 
     def _on_login_success(self, client: ConferenceClient, username: str):
         self._client = client
@@ -1020,6 +1239,15 @@ class ClientGUI(ttk.Window):
         )
         self._notebook.add(self._telephone_frame, text="IP电话")
 
+        self._private_call_frame = PrivateCallFrame(
+            self._notebook,
+            self._client,
+            on_state_change=self._sync_feature_availability,
+            on_activate=self._activate_private_call_tab,
+        )
+        self._notebook.add(self._private_call_frame, text="私聊语音")
+        self._sync_feature_availability()
+
     def _enter_room(self, room_id: str):
         """进入聊天室"""
         if self._chatroom_frame:
@@ -1033,6 +1261,8 @@ class ClientGUI(ttk.Window):
 
         # 禁用IP电话页面的创建按钮
         self._telephone_frame.btn_create.config(state="disabled")
+        if self._private_call_frame:
+            self._private_call_frame.refresh_availability()
 
     def _exit_room(self):
         """退出聊天室"""
@@ -1044,7 +1274,23 @@ class ClientGUI(ttk.Window):
 
         # 恢复IP电话页面
         self._telephone_frame._reset_ui()
+        self._sync_feature_availability()
         self._notebook.select(self._telephone_frame)
+
+    def _activate_private_call_tab(self):
+        if self._private_call_frame and self._notebook:
+            self._notebook.select(self._private_call_frame)
+
+    def _sync_feature_availability(self):
+        if not self._client:
+            return
+        call_busy = self._client.call_state not in ("idle", "ended")
+        in_room = self._client.room_state == RoomState.IN_ROOM
+        self._telephone_frame.btn_create.config(
+            state="disabled" if call_busy or in_room else "normal"
+        )
+        if self._private_call_frame:
+            self._private_call_frame.refresh_availability()
 
     def _on_logout(self):
         if messagebox.askyesno("确认", "确定要登出吗?"):
@@ -1055,6 +1301,7 @@ class ClientGUI(ttk.Window):
                 self._main_frame.destroy()
                 self._main_frame = None
             self._chatroom_frame = None
+            self._private_call_frame = None
             self._notebook = None
             self._login_frame = LoginFrame(self, self._on_login_success)
             self._login_frame.pack(fill="both", expand=True)

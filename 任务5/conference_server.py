@@ -5,6 +5,7 @@ Task 5 conference server with per-client adaptive downstream audio delivery.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import random
 import socket
@@ -27,13 +28,18 @@ from audio_adaptive import (
 from conference_protocol import (
     MAX_ROOM_SIZE,
     MESSAGE_DELIMITER,
+    decode_media_packet,
     decode_message,
     decode_udp_audio_packet,
-    encode_response,
+    encode_call_busy,
+    encode_call_not_found,
+    encode_call_ready,
     encode_room_audio_chunk,
     encode_room_dismissed_notify,
     encode_room_invite_notify,
     encode_room_member_update,
+    encode_transport_update,
+    encode_response,
     encode_udp_audio_packet,
 )
 
@@ -51,6 +57,7 @@ from data_store import get_data_store
 
 
 DEFAULT_PORT = 8882
+NEGOTIATION_TIMEOUT_SEC = 1.6
 
 
 @dataclass(frozen=True)
@@ -107,9 +114,26 @@ class ClientInfo:
     username: str = ""
     room_id: str = ""
     udp_addr: Optional[Tuple[str, int]] = None
+    media_port: int = 0
+    local_ip: str = ""
+    pending_peer: str = ""
+    in_call_with: str = ""
+    call_mode: str = ""
+    call_id: str = ""
+    call_udp_observed_addr: Optional[Tuple[str, int]] = None
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     audio_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     audio_state: ClientAudioState = field(default_factory=ClientAudioState, repr=False)
+
+
+@dataclass
+class CallSession:
+    call_id: str
+    caller: str
+    callee: str
+    direct_seen: Set[str] = field(default_factory=set)
+    final_mode: str = ""
+    timer: Optional[threading.Timer] = None
 
 
 @dataclass
@@ -147,19 +171,26 @@ class ConferenceServer:
         self._port = port
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._media_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._media_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._media_sock.settimeout(0.5)
         self._clients: Dict[int, ClientInfo] = {}
         self._username_map: Dict[str, int] = {}
         self._rooms: Dict[str, ChatRoom] = {}
+        self._sessions: Dict[str, CallSession] = {}
         self._lock = threading.RLock()
         self._running = False
         self._data_store = get_data_store()
         self._impairment = NetworkImpairment.from_env()
+        self._media_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         self._sock.bind((self._host, self._port))
         self._sock.listen(20)
+        self._media_sock.bind((self._host, self._port))
         self._running = True
         print(f"[Server] Listening on {self._host}:{self._port}")
+        print(f"[Server] Private-call UDP relay on {self._host}:{self._port}")
         if self._impairment.enabled:
             print(
                 "[Server] Network impairment: "
@@ -167,6 +198,10 @@ class ConferenceServer:
                 f"jitter={self._impairment.jitter_ms:.1f}ms, "
                 f"loss={self._impairment.loss_rate * 100:.1f}%"
             )
+        self._media_thread = threading.Thread(
+            target=self._private_call_udp_loop, daemon=True
+        )
+        self._media_thread.start()
         try:
             while self._running:
                 try:
@@ -186,9 +221,17 @@ class ConferenceServer:
             self._sock.close()
         except Exception:
             pass
+        try:
+            self._media_sock.close()
+        except Exception:
+            pass
 
     def _cleanup(self) -> None:
         with self._lock:
+            for session in list(self._sessions.values()):
+                if session.timer:
+                    session.timer.cancel()
+            self._sessions.clear()
             for room in list(self._rooms.values()):
                 self._close_room_udp(room)
             for info in list(self._clients.values()):
@@ -201,6 +244,10 @@ class ConferenceServer:
             self._rooms.clear()
         try:
             self._sock.close()
+        except Exception:
+            pass
+        try:
+            self._media_sock.close()
         except Exception:
             pass
 
@@ -244,6 +291,12 @@ class ConferenceServer:
             "contact_list": lambda: self._handle_contact_op(cid, payload, "list"),
             "contact_search": lambda: self._handle_contact_op(cid, payload, "search"),
             "online_query": lambda: self._handle_online_query(cid),
+            "call_invite": lambda: self._handle_call_invite(cid, payload),
+            "call_accept": lambda: self._handle_call_accept(cid, payload),
+            "call_reject": lambda: self._handle_call_reject(cid, payload),
+            "call_hangup": lambda: self._handle_call_hangup(cid, payload),
+            "direct_path_seen": lambda: self._handle_direct_path_seen(cid, payload),
+            "media_stop": lambda: self._handle_media_stop(cid, payload),
             "room_create": lambda: self._handle_room_create(cid, payload),
             "room_invite": lambda: self._handle_room_invite(cid, payload),
             "room_join": lambda: self._handle_room_join(cid, payload),
@@ -261,6 +314,11 @@ class ConferenceServer:
         if not username:
             self._send(conn, encode_response(False, "empty username"))
             return
+        try:
+            media_port = int(payload.get("media_port", 0) or 0)
+        except (TypeError, ValueError):
+            media_port = 0
+        local_ip = str(payload.get("local_ip", "")).strip()
         self._data_store.ensure_user(username)
         with self._lock:
             if username in self._username_map:
@@ -269,6 +327,10 @@ class ConferenceServer:
             info = self._clients.get(cid)
             if info:
                 info.username = username
+                info.media_port = max(media_port, 0)
+                info.local_ip = local_ip or info.addr[0]
+                if info.media_port > 0:
+                    info.call_udp_observed_addr = (info.addr[0], info.media_port)
             self._username_map[username] = cid
         self._send(conn, encode_response(True, "login ok"))
         print(f"[Server] {username} logged in")
@@ -280,6 +342,12 @@ class ConferenceServer:
                 return
             username = info.username
             room_id = info.room_id
+            target = info.in_call_with or info.pending_peer
+            call_id = info.call_id
+        if call_id:
+            self._discard_session(call_id)
+        if target:
+            self._end_call(username, target)
         if room_id:
             self._remove_from_room(username, room_id)
         with self._lock:
@@ -288,21 +356,38 @@ class ConferenceServer:
                 info.username = ""
                 info.room_id = ""
                 self._reset_client_audio_state(info)
+                self._reset_client_call_state(info)
             self._username_map.pop(username, None)
         print(f"[Server] {username} logged out")
 
     def _handle_disconnect(self, cid) -> None:
         with self._lock:
-            info = self._clients.pop(cid, None)
+            info = self._clients.get(cid)
             if not info:
                 return
             username = info.username
             room_id = info.room_id
+            target = info.in_call_with or info.pending_peer
+            call_id = info.call_id
+
+        if call_id:
+            self._discard_session(call_id)
+        if username and target:
+            self._end_call(username, target)
         if username and room_id:
             self._remove_from_room(username, room_id)
-        if username:
-            with self._lock:
+
+        with self._lock:
+            info = self._clients.pop(cid, None)
+            if info and info.username:
+                self._username_map.pop(info.username, None)
+            elif username:
                 self._username_map.pop(username, None)
+        if info:
+            try:
+                info.conn.close()
+            except Exception:
+                pass
 
     def _handle_contact_op(self, cid, payload, op) -> None:
         with self._lock:
@@ -353,6 +438,18 @@ class ConferenceServer:
         self._send_by_cid(
             cid, encode_response(True, "ok", {"online_users": online_users})
         )
+
+    def _reset_client_call_state(self, info: ClientInfo) -> None:
+        info.pending_peer = ""
+        info.in_call_with = ""
+        info.call_mode = ""
+        info.call_id = ""
+        info.call_udp_observed_addr = (
+            (info.addr[0], info.media_port) if info.media_port > 0 else None
+        )
+
+    def _is_private_call_busy(self, info: ClientInfo) -> bool:
+        return bool(info.pending_peer or info.in_call_with)
 
     def _reset_client_audio_state(self, info: ClientInfo) -> None:
         info.udp_addr = None
@@ -409,6 +506,238 @@ class ConferenceServer:
                 f"loss={packet_loss_percent:.1f}%)"
             )
 
+    def _handle_call_invite(self, cid, payload) -> None:
+        target = str(payload.get("target", "")).strip()
+        if not target:
+            return
+
+        with self._lock:
+            caller_info = self._clients.get(cid)
+            if not caller_info or not caller_info.username:
+                return
+            caller = caller_info.username
+
+            if caller == target:
+                self._send_by_cid(cid, encode_response(False, "cannot call yourself"))
+                return
+            if caller_info.room_id:
+                self._send_by_cid(cid, encode_response(False, "leave room before private call"))
+                return
+            if self._is_private_call_busy(caller_info):
+                self._send_by_cid(cid, encode_response(False, "caller is busy"))
+                return
+
+            target_cid = self._username_map.get(target)
+            target_info = self._clients.get(target_cid) if target_cid else None
+            if not target_info:
+                self._send_by_cid(cid, encode_call_not_found(target))
+                return
+            if target_info.room_id or self._is_private_call_busy(target_info):
+                self._send_by_cid(cid, encode_call_busy(target))
+                return
+
+            caller_info.pending_peer = target
+            target_info.pending_peer = caller
+
+        invite = {"type": "call_invite", "caller": caller}
+        self._send_by_cid(target_cid, json.dumps(invite, ensure_ascii=False))
+
+    def _handle_call_accept(self, cid, payload) -> None:
+        caller = str(payload.get("caller", "")).strip()
+        if not caller:
+            return
+
+        with self._lock:
+            callee_info = self._clients.get(cid)
+            if not callee_info or not callee_info.username:
+                return
+            callee = callee_info.username
+            caller_cid = self._username_map.get(caller)
+            caller_info = self._clients.get(caller_cid) if caller_cid else None
+            if not caller_info:
+                self._send_by_cid(cid, encode_call_not_found(caller))
+                return
+            if callee_info.room_id or caller_info.room_id:
+                self._send_by_cid(cid, encode_response(False, "room members cannot start private calls"))
+                return
+            if callee_info.pending_peer != caller or caller_info.pending_peer != callee:
+                self._send_by_cid(cid, encode_response(False, "no matching pending call"))
+                return
+
+            call_id = uuid.uuid4().hex
+            session = CallSession(call_id=call_id, caller=caller, callee=callee)
+            self._sessions[call_id] = session
+
+            caller_info.pending_peer = ""
+            callee_info.pending_peer = ""
+            caller_info.in_call_with = callee
+            callee_info.in_call_with = caller
+            caller_info.call_mode = "negotiating"
+            callee_info.call_mode = "negotiating"
+            caller_info.call_id = call_id
+            callee_info.call_id = call_id
+
+            caller_ready = encode_call_ready(
+                call_id=call_id,
+                peer=callee,
+                mode="negotiating",
+                peer_ip=callee_info.local_ip,
+                peer_port=callee_info.media_port,
+                relay_port=self._port,
+                detail="Trying direct UDP first; will fall back to relay if needed.",
+            )
+            callee_ready = encode_call_ready(
+                call_id=call_id,
+                peer=caller,
+                mode="negotiating",
+                peer_ip=caller_info.local_ip,
+                peer_port=caller_info.media_port,
+                relay_port=self._port,
+                detail="Trying direct UDP first; will fall back to relay if needed.",
+            )
+
+        self._send_by_cid(caller_cid, caller_ready)
+        self._send_by_cid(cid, callee_ready)
+        self._arm_negotiation_timer(call_id)
+
+    def _handle_call_reject(self, cid, payload) -> None:
+        caller = str(payload.get("caller", "")).strip()
+        reason = str(payload.get("reason", "")).strip() or "call rejected"
+
+        with self._lock:
+            callee_info = self._clients.get(cid)
+            if not callee_info or not callee_info.username:
+                return
+            callee = callee_info.username
+            caller_cid = self._username_map.get(caller)
+            caller_info = self._clients.get(caller_cid) if caller_cid else None
+
+            callee_info.pending_peer = ""
+            if caller_info and caller_info.pending_peer == callee:
+                caller_info.pending_peer = ""
+
+        if caller_cid:
+            reject_msg = {
+                "type": "call_reject",
+                "caller": callee,
+                "reason": reason,
+            }
+            self._send_by_cid(caller_cid, json.dumps(reject_msg, ensure_ascii=False))
+
+    def _handle_call_hangup(self, cid, payload) -> None:
+        with self._lock:
+            info = self._clients.get(cid)
+            if not info or not info.username:
+                return
+            username = info.username
+            target = str(payload.get("target", "")).strip() or info.in_call_with or info.pending_peer
+
+        self._end_call(username, target)
+
+    def _handle_direct_path_seen(self, cid, payload) -> None:
+        call_id = str(payload.get("call_id", "")).strip()
+        if not call_id:
+            return
+
+        finalize = False
+        with self._lock:
+            info = self._clients.get(cid)
+            session = self._sessions.get(call_id)
+            if not info or not info.username or not session or session.final_mode:
+                return
+            if info.username not in (session.caller, session.callee):
+                return
+            session.direct_seen.add(info.username)
+            finalize = len(session.direct_seen) == 2
+
+        if finalize:
+            self._finalize_session(
+                call_id, "p2p", "both peers confirmed direct UDP path"
+            )
+
+    def _handle_media_stop(self, cid, payload) -> None:
+        with self._lock:
+            info = self._clients.get(cid)
+            if not info or not info.username:
+                return
+            source = info.username
+            target = str(payload.get("target", "")).strip() or info.in_call_with
+            target_cid = self._username_map.get(target) if target else None
+        if not target_cid:
+            return
+        msg = {"type": "media_stop", "peer": source}
+        self._send_by_cid(target_cid, json.dumps(msg, ensure_ascii=False))
+
+    def _end_call(self, username: str, target: str, notify: bool = True) -> None:
+        if not username or not target:
+            return
+
+        with self._lock:
+            user_cid = self._username_map.get(username)
+            user_info = self._clients.get(user_cid) if user_cid else None
+            target_cid = self._username_map.get(target)
+            target_info = self._clients.get(target_cid) if target_cid else None
+            call_id = ""
+            if user_info:
+                call_id = user_info.call_id
+                self._reset_client_call_state(user_info)
+            if target_info:
+                if target_info.pending_peer == username or target_info.in_call_with == username:
+                    call_id = call_id or target_info.call_id
+                    self._reset_client_call_state(target_info)
+
+        if call_id:
+            self._discard_session(call_id)
+        if notify and target_cid:
+            hangup = {"type": "call_hangup", "peer": username}
+            self._send_by_cid(target_cid, json.dumps(hangup, ensure_ascii=False))
+
+    def _arm_negotiation_timer(self, call_id: str) -> None:
+        timer = threading.Timer(
+            NEGOTIATION_TIMEOUT_SEC,
+            lambda: self._finalize_session(
+                call_id, "relay", "direct UDP was not confirmed in time"
+            ),
+        )
+        timer.daemon = True
+        with self._lock:
+            session = self._sessions.get(call_id)
+            if not session:
+                return
+            session.timer = timer
+        timer.start()
+
+    def _finalize_session(self, call_id: str, mode: str, reason: str) -> None:
+        with self._lock:
+            session = self._sessions.get(call_id)
+            if not session or session.final_mode:
+                return
+            session.final_mode = mode
+            if session.timer:
+                session.timer.cancel()
+                session.timer = None
+
+            caller_cid = self._username_map.get(session.caller)
+            callee_cid = self._username_map.get(session.callee)
+            caller_info = self._clients.get(caller_cid) if caller_cid else None
+            callee_info = self._clients.get(callee_cid) if callee_cid else None
+            if caller_info and caller_info.call_id == call_id:
+                caller_info.call_mode = mode
+            if callee_info and callee_info.call_id == call_id:
+                callee_info.call_mode = mode
+
+            caller_msg = encode_transport_update(call_id, session.callee, mode, reason)
+            callee_msg = encode_transport_update(call_id, session.caller, mode, reason)
+
+        self._send_by_cid(caller_cid, caller_msg)
+        self._send_by_cid(callee_cid, callee_msg)
+
+    def _discard_session(self, call_id: str) -> None:
+        with self._lock:
+            session = self._sessions.pop(call_id, None)
+        if session and session.timer:
+            session.timer.cancel()
+
     def _adapt_audio_chunks_for_client(
         self,
         target_cid: int,
@@ -454,6 +783,11 @@ class ConferenceServer:
                 return
             if info.room_id:
                 self._send_by_cid(cid, encode_response(False, "already in room"))
+                return
+            if self._is_private_call_busy(info):
+                self._send_by_cid(
+                    cid, encode_response(False, "finish private call before creating room")
+                )
                 return
 
             creator = info.username
@@ -501,6 +835,11 @@ class ConferenceServer:
             if not room:
                 self._send_by_cid(cid, encode_response(False, "room not found"))
                 return
+            if self._is_private_call_busy(info):
+                self._send_by_cid(
+                    cid, encode_response(False, "finish private call before inviting")
+                )
+                return
             if len(room.members) >= MAX_ROOM_SIZE:
                 self._send_by_cid(cid, encode_response(False, "room full"))
                 return
@@ -512,7 +851,7 @@ class ConferenceServer:
                 return
             target_cid = self._username_map[target]
             target_info = self._clients.get(target_cid)
-            if target_info and target_info.room_id:
+            if target_info and (target_info.room_id or self._is_private_call_busy(target_info)):
                 self._send_by_cid(cid, encode_response(False, "target busy"))
                 return
             room.invited.add(target)
@@ -531,6 +870,11 @@ class ConferenceServer:
             username = info.username
             if info.room_id:
                 self._send_by_cid(cid, encode_response(False, "already in room"))
+                return
+            if self._is_private_call_busy(info):
+                self._send_by_cid(
+                    cid, encode_response(False, "finish private call before joining room")
+                )
                 return
             room = self._rooms.get(room_id)
             if not room:
@@ -753,6 +1097,55 @@ class ConferenceServer:
                     self._send_udp_audio(udp_sock, packet, target_addr)
 
         print(f"[Server] UDP recv loop for room {room_id} stopped")
+
+    def _private_call_udp_loop(self) -> None:
+        while self._running:
+            try:
+                data, addr = self._media_sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            try:
+                packet_type, packet = decode_media_packet(data)
+            except ValueError:
+                continue
+
+            sender = str(packet.get("sender", "")).strip()
+            if not sender:
+                continue
+
+            with self._lock:
+                sender_cid = self._username_map.get(sender)
+                sender_info = self._clients.get(sender_cid) if sender_cid else None
+                if sender_info:
+                    sender_info.call_udp_observed_addr = addr
+
+            if not sender_info:
+                continue
+
+            if packet_type == "media_probe":
+                continue
+
+            target = str(packet.get("target", "")).strip()
+            if not target or sender_info.in_call_with != target:
+                continue
+            if sender_info.call_mode == "p2p":
+                continue
+
+            with self._lock:
+                target_cid = self._username_map.get(target)
+                target_info = self._clients.get(target_cid) if target_cid else None
+                if not target_info:
+                    continue
+                forward_addr = target_info.call_udp_observed_addr
+                if not forward_addr and target_info.media_port > 0:
+                    forward_addr = (target_info.addr[0], target_info.media_port)
+
+            if not forward_addr:
+                continue
+            self._send_udp_audio(self._media_sock, data, forward_addr)
 
     def _close_room_udp(self, room: ChatRoom) -> None:
         if room._udp_sock:
