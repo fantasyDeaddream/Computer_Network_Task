@@ -489,6 +489,8 @@ class ChatRoomFrame(ttk.Frame):
         self._avatar_images = {}  # position -> PhotoImage (prevent GC)
         self._volume_controls: dict[str, tuple[tk.DoubleVar, ttk.Scale]] = {}
         self._quality_reports: dict[str, dict] = {}
+        self._volume_bars: dict[int, tuple[tk.Canvas, int]] = {}
+        self._volume_update_job = None
         self._build_ui()
 
         # 注册回调
@@ -502,6 +504,7 @@ class ChatRoomFrame(ttk.Frame):
                 self._client._cached_members, self._client._cached_positions
             )
         self._render_quality_reports(self._client.get_quality_reports())
+        self._start_volume_update()
 
     def _build_ui(self):
         # 顶部信息栏
@@ -550,16 +553,30 @@ class ChatRoomFrame(ttk.Frame):
             cell = ttk.Frame(inner, relief="groove", borderwidth=1)
             cell.grid(row=row, column=col, padx=4, pady=4, sticky="nsew")
 
-            # 头像（纯白圆形）
+            avatar_frame = ttk.Frame(cell)
+            avatar_frame.pack(padx=5, pady=(5, 2))
+
+            volume_bar = tk.Canvas(
+                avatar_frame,
+                width=6,
+                height=self.AVATAR_SIZE,
+                highlightthickness=0,
+                bg="#f0f0f0",
+            )
+            volume_bar.pack(side="left", padx=(0, 3))
+            bar_rect = volume_bar.create_rectangle(
+                1, self.AVATAR_SIZE - 1, 5, self.AVATAR_SIZE - 1, fill="#4caf50", outline=""
+            )
+            self._volume_bars[pos] = (volume_bar, bar_rect)
+
             canvas = tk.Canvas(
-                cell,
+                avatar_frame,
                 width=self.AVATAR_SIZE,
                 height=self.AVATAR_SIZE,
                 highlightthickness=0,
                 bg="#f0f0f0",
             )
-            canvas.pack(padx=5, pady=(5, 2))
-            # 画纯白圆形头像
+            canvas.pack(side="left")
             canvas.create_oval(
                 2,
                 2,
@@ -570,7 +587,6 @@ class ChatRoomFrame(ttk.Frame):
                 width=1,
             )
 
-            # 用户名标签
             label = ttk.Label(
                 cell,
                 text="空位",
@@ -845,6 +861,32 @@ class ChatRoomFrame(ttk.Frame):
             return
         self._client.set_sender_volume(username, volume)
 
+    def _start_volume_update(self):
+        self._update_volume_bars()
+
+    def _update_volume_bars(self):
+        if not self.winfo_exists():
+            return
+        volumes = self._client.get_volume_levels()
+        for pos, uname in self._members.items():
+            level = volumes.get(uname, 0.0)
+            if pos in self._volume_bars:
+                canvas, rect = self._volume_bars[pos]
+                bar_height = int(level * (self.AVATAR_SIZE - 2))
+                y0 = self.AVATAR_SIZE - 1 - bar_height
+                canvas.coords(rect, 1, y0, 5, self.AVATAR_SIZE - 1)
+                if level > 0.6:
+                    canvas.itemconfig(rect, fill="#f44336")
+                elif level > 0.3:
+                    canvas.itemconfig(rect, fill="#ff9800")
+                else:
+                    canvas.itemconfig(rect, fill="#4caf50")
+        for pos in range(MAX_ROOM_SIZE):
+            if pos not in self._members and pos in self._volume_bars:
+                canvas, rect = self._volume_bars[pos]
+                canvas.coords(rect, 1, self.AVATAR_SIZE - 1, 5, self.AVATAR_SIZE - 1)
+        self._volume_update_job = self.after(50, self._update_volume_bars)
+
     def _on_quality_update(self, reports: dict[str, dict]) -> None:
         self.after(0, lambda: self._render_quality_reports(reports))
 
@@ -907,6 +949,9 @@ class ChatRoomFrame(ttk.Frame):
         self._on_exit_room()
 
     def destroy(self):
+        if self._volume_update_job:
+            self.after_cancel(self._volume_update_job)
+            self._volume_update_job = None
         self._client._on_quality_update = None
         super().destroy()
 

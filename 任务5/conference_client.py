@@ -109,6 +109,8 @@ class ConferenceClient:
         self._playback_active = False
         self._sender_volumes: Dict[str, float] = {}
         self._lowpass_state: Dict[str, float] = {}
+        self._volume_levels: Dict[str, float] = {}
+        self._on_volume_update: Optional[Callable[[Dict[str, float]], None]] = None
 
         # UDP音频相关
         self._udp_sock: Optional[socket.socket] = None
@@ -158,6 +160,9 @@ class ConferenceClient:
 
     def get_quality_reports(self) -> Dict[str, dict]:
         return self._quality_monitor.get_reports()
+
+    def get_volume_levels(self) -> Dict[str, float]:
+        return self._volume_levels.copy()
 
     def reset_quality_stats(self) -> None:
         self._quality_monitor.reset()
@@ -464,6 +469,7 @@ class ConferenceClient:
         with self._incoming_audio_lock:
             self._incoming_audio.clear()
             self._lowpass_state.clear()
+            self._volume_levels.clear()
 
     def _next_audio_metadata(self) -> tuple[int, int]:
         seq = self._audio_seq
@@ -647,11 +653,24 @@ class ConferenceClient:
         if not raw:
             return
         filtered = self._apply_noise_lowpass(sender, raw)
+        self._update_volume_level(sender, filtered)
         with self._incoming_audio_lock:
             queue = self._incoming_audio.setdefault(sender, deque())
             if len(queue) > 50:
                 queue.popleft()
             queue.append(filtered)
+
+    def _update_volume_level(self, sender: str, raw: bytes) -> None:
+        if len(raw) < 2:
+            return
+        sample_count = len(raw) // 2
+        try:
+            samples = struct.unpack(f"<{sample_count}h", raw)
+            rms = math.sqrt(sum(s * s for s in samples) / sample_count)
+            normalized = min(rms / 10000.0, 1.0)
+            self._volume_levels[sender] = normalized
+        except Exception:
+            pass
 
     def _apply_noise_lowpass(self, sender: str, raw: bytes) -> bytes:
         if len(raw) < 2:
