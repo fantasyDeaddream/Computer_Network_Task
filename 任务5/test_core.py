@@ -46,18 +46,34 @@ def main():
         decode_message,
         decode_udp_audio_packet,
         encode_room_audio_chunk,
+        encode_quality_report,
         encode_udp_audio_packet,
     )
+    from audio_adaptive import CANONICAL_AUDIO_FORMAT
     from emodel import evaluate_quality
 
-    encoded = encode_room_audio_chunk("r1", "alice", b"abc", seq=7, timestamp_ms=123)
+    encoded = encode_room_audio_chunk(
+        "r1",
+        "alice",
+        b"abc",
+        seq=7,
+        timestamp_ms=123,
+        audio_format=CANONICAL_AUDIO_FORMAT.to_payload(),
+    )
     mtype, payload = decode_message(encoded)
     assert mtype == "room_audio_chunk"
     assert payload["seq"] == 7 and payload["timestamp_ms"] == 123
 
-    udp_packet = encode_udp_audio_packet("alice", b"abc", seq=8, timestamp_ms=456)
-    sender, seq, timestamp_ms, raw = decode_udp_audio_packet(udp_packet)
+    udp_packet = encode_udp_audio_packet(
+        "alice",
+        b"abc",
+        seq=8,
+        timestamp_ms=456,
+        audio_format=CANONICAL_AUDIO_FORMAT.to_payload(),
+    )
+    sender, seq, timestamp_ms, raw, audio_format = decode_udp_audio_packet(udp_packet)
     assert (sender, seq, timestamp_ms, raw) == ("alice", 8, 456, b"abc")
+    assert audio_format["sample_rate"] == CANONICAL_AUDIO_FORMAT.sample_rate
 
     quality = evaluate_quality(delay_ms=50, packet_loss_percent=0, jitter_ms=5)
     assert quality.r_factor > 80 and quality.mos > 4.0
@@ -139,7 +155,52 @@ def main():
         f"{'PASS' if alice_update else 'INFO'}: Alice member update after Bob joined"
     )
 
-    # --- Test 5: Leave Room ---
+    # --- Test 5: Adaptive downstream audio ---
+    send_msg(
+        s2,
+        json.loads(
+            encode_quality_report(
+                room_id,
+                "bob",
+                delay_ms=420,
+                jitter_ms=120,
+                packet_loss_percent=9.0,
+                sample_count=1,
+            )
+        ),
+    )
+    time.sleep(0.2)
+
+    adaptive_audio = bytes([64, 192]) * CANONICAL_AUDIO_FORMAT.chunk_size
+    send_msg(
+        s1,
+        json.loads(
+            encode_room_audio_chunk(
+                room_id,
+                "alice",
+                adaptive_audio,
+                seq=11,
+                timestamp_ms=789,
+                audio_format=CANONICAL_AUDIO_FORMAT.to_payload(),
+            )
+        ),
+    )
+    time.sleep(0.4)
+
+    msgs_b = recv_all(s2)
+    adaptive_chunks = [
+        m for m in msgs_b if m.get("type") == "room_audio_chunk" and m.get("sender") == "alice"
+    ]
+    assert adaptive_chunks, f"Adaptive room audio not received: {msgs_b}"
+    adaptive_format = adaptive_chunks[0].get("audio_format", {})
+    assert adaptive_format.get("sample_rate") == 8000, adaptive_chunks[0]
+    assert adaptive_format.get("channels") == 1, adaptive_chunks[0]
+    assert adaptive_format.get("sample_width") == 1, adaptive_chunks[0]
+    assert adaptive_format.get("chunk_size") == 256, adaptive_chunks[0]
+    assert adaptive_chunks[0].get("profile") == "resilient", adaptive_chunks[0]
+    results.append("PASS: Adaptive downstream audio profile applied")
+
+    # --- Test 6: Leave Room ---
     send_msg(s2, {"type": "room_leave", "room_id": room_id, "username": "bob"})
     time.sleep(0.3)
     msgs_b = recv_all(s2)
@@ -147,7 +208,7 @@ def main():
     assert leave_ok, f"Leave failed: {msgs_b}"
     results.append("PASS: Bob left room")
 
-    # --- Test 6: Dismiss Room ---
+    # --- Test 7: Dismiss Room ---
     # Re-invite and join Bob
     send_msg(
         s1,

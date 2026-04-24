@@ -624,13 +624,19 @@ class ChatRoomFrame(ttk.Frame):
         status_bar.pack(fill="x", padx=10, pady=5)
 
         proto_label = self._client.audio_protocol.upper()
-        self._status_label = ttk.Label(
-            status_bar, text=f"语音通话中... ({proto_label})", foreground="green"
-        )
+        self._status_label = ttk.Label(status_bar, foreground="green")
         self._status_label.pack(side="left")
+        self._refresh_status_text()
 
         self._member_count_label = ttk.Label(status_bar, text="成员: 0/20")
         self._member_count_label.pack(side="right")
+
+    def _refresh_status_text(self) -> None:
+        proto_label = self._client.audio_protocol.upper()
+        adaptive_desc = self._client.get_active_receive_audio_description()
+        self._status_label.config(
+            text=f"语音通话中... ({proto_label} | 下行自适应: {adaptive_desc})"
+        )
 
     def _on_invite(self):
         """弹出邀请对话框，支持从电话本下拉选择联系人（显示在线状态）"""
@@ -889,6 +895,7 @@ class ChatRoomFrame(ttk.Frame):
 
     def _on_quality_update(self, reports: dict[str, dict]) -> None:
         self.after(0, lambda: self._render_quality_reports(reports))
+        self.after(0, self._refresh_status_text)
 
     def _render_quality_reports(self, reports: dict[str, dict]) -> None:
         self._quality_reports = reports

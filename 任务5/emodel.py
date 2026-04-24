@@ -256,4 +256,7 @@ class AudioQualityMonitor:
             "delay_impairment": result.delay_impairment,
             "equipment_impairment": result.equipment_impairment,
             "effective_delay_ms": result.effective_delay_ms,
+            "first_seen": state.first_seen,
+            "last_seen": state.last_seen,
+            "last_seen_age_s": max(0.0, time.time() - state.last_seen),
         }

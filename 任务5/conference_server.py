@@ -1,29 +1,40 @@
 """
-任务5 - 多方语音会议系统服务器
-
-在任务4服务器基础上扩展，增加聊天室管理和组播音频转发功能。
+Task 5 conference server with per-client adaptive downstream audio delivery.
 """
 
-import json
+from __future__ import annotations
+
+import base64
 import os
 import random
 import socket
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import sys
 
+from audio_adaptive import (
+    AudioFormat,
+    CANONICAL_AUDIO_FORMAT,
+    DEFAULT_ADAPTIVE_PROFILE,
+    ReframingAudioTranscoder,
+    choose_adaptive_profile,
+    get_profile_by_name,
+)
 from conference_protocol import (
-    decode_message,
-    encode_response,
-    encode_room_invite_notify,
-    encode_room_dismissed_notify,
-    encode_room_member_update,
-    decode_udp_audio_packet,
     MAX_ROOM_SIZE,
     MESSAGE_DELIMITER,
+    decode_message,
+    decode_udp_audio_packet,
+    encode_response,
+    encode_room_audio_chunk,
+    encode_room_dismissed_notify,
+    encode_room_invite_notify,
+    encode_room_member_update,
+    encode_udp_audio_packet,
 )
 
 
@@ -35,7 +46,9 @@ def _ensure_task4_on_path() -> None:
 
 
 _ensure_task4_on_path()
+
 from data_store import get_data_store
+
 
 DEFAULT_PORT = 8882
 
@@ -77,22 +90,36 @@ class NetworkImpairment:
 
 
 @dataclass
+class ClientAudioState:
+    delay_ms: float = 0.0
+    jitter_ms: float = 0.0
+    packet_loss_percent: float = 0.0
+    last_reported_at: float = 0.0
+    profile_name: str = DEFAULT_ADAPTIVE_PROFILE.name
+    outgoing_seq: Dict[str, int] = field(default_factory=dict)
+    transcoders: Dict[str, ReframingAudioTranscoder] = field(default_factory=dict)
+
+
+@dataclass
 class ClientInfo:
     conn: socket.socket
     addr: Tuple[str, int]
     username: str = ""
     room_id: str = ""
-    udp_addr: Optional[Tuple[str, int]] = None  # 客户端的UDP地址（用于UDP音频转发）
+    udp_addr: Optional[Tuple[str, int]] = None
+    send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    audio_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    audio_state: ClientAudioState = field(default_factory=ClientAudioState, repr=False)
 
 
 @dataclass
 class ChatRoom:
     room_id: str
     creator: str
-    audio_protocol: str = "tcp"  # "tcp" 或 "udp"
+    audio_protocol: str = "tcp"
     members: Dict[str, int] = field(default_factory=dict)
     invited: Set[str] = field(default_factory=set)
-    udp_port: int = 0  # UDP模式下服务器分配的UDP端口
+    udp_port: int = 0
     _udp_sock: Optional[socket.socket] = field(default=None, repr=False)
 
     def get_available_positions(self) -> List[int]:
@@ -109,13 +136,12 @@ class ChatRoom:
 
     def get_member_list(self) -> List[dict]:
         return [
-            {"username": u, "position": p}
-            for u, p in sorted(self.members.items(), key=lambda x: x[1])
+            {"username": username, "position": position}
+            for username, position in sorted(self.members.items(), key=lambda item: item[1])
         ]
 
 
 class ConferenceServer:
-
     def __init__(self, host: str = "0.0.0.0", port: int = DEFAULT_PORT) -> None:
         self._host = host
         self._port = port
@@ -163,7 +189,9 @@ class ConferenceServer:
 
     def _cleanup(self) -> None:
         with self._lock:
-            for cid, info in list(self._clients.items()):
+            for room in list(self._rooms.values()):
+                self._close_room_udp(room)
+            for info in list(self._clients.values()):
                 try:
                     info.conn.close()
                 except Exception:
@@ -181,6 +209,7 @@ class ConferenceServer:
         with self._lock:
             self._clients[cid] = ClientInfo(conn=conn, addr=addr)
         print(f"[Server] New connection: {addr}")
+
         buf = ""
         try:
             while self._running:
@@ -194,10 +223,10 @@ class ConferenceServer:
                     if not line:
                         continue
                     try:
-                        mtype, payload = decode_message(line)
+                        message_type, payload = decode_message(line)
                     except ValueError:
                         continue
-                    self._dispatch(cid, mtype, payload, conn, line)
+                    self._dispatch(cid, message_type, payload, conn)
         except ConnectionResetError:
             pass
         except OSError:
@@ -205,7 +234,7 @@ class ConferenceServer:
         finally:
             self._handle_disconnect(cid)
 
-    def _dispatch(self, cid, mtype, payload, conn, raw):
+    def _dispatch(self, cid, message_type, payload, conn) -> None:
         handlers = {
             "login": lambda: self._handle_login(cid, payload, conn),
             "logout": lambda: self._handle_logout(cid),
@@ -220,110 +249,200 @@ class ConferenceServer:
             "room_join": lambda: self._handle_room_join(cid, payload),
             "room_leave": lambda: self._handle_room_leave(cid, payload),
             "room_dismiss": lambda: self._handle_room_dismiss(cid, payload),
-            "room_audio_chunk": lambda: self._forward_room_audio(cid, raw),
+            "room_audio_chunk": lambda: self._forward_room_audio(cid, payload),
+            "quality_report": lambda: self._handle_quality_report(cid, payload),
         }
-        h = handlers.get(mtype)
-        if h:
-            h()
+        handler = handlers.get(message_type)
+        if handler:
+            handler()
 
-    # ---- auth ----
-
-    def _handle_login(self, cid, payload, conn):
+    def _handle_login(self, cid, payload, conn) -> None:
         username = payload.get("username", "")
         if not username:
-            self._send(conn, encode_response(False, "用户名不能为空"))
+            self._send(conn, encode_response(False, "empty username"))
             return
         self._data_store.ensure_user(username)
         with self._lock:
             if username in self._username_map:
-                self._send(conn, encode_response(False, "用户已在线"))
+                self._send(conn, encode_response(False, "user already online"))
                 return
             info = self._clients.get(cid)
             if info:
                 info.username = username
             self._username_map[username] = cid
-        self._send(conn, encode_response(True, "登录成功"))
+        self._send(conn, encode_response(True, "login ok"))
         print(f"[Server] {username} logged in")
 
-    def _handle_logout(self, cid):
+    def _handle_logout(self, cid) -> None:
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
                 return
-            if info.room_id:
-                self._remove_from_room(info.username, info.room_id)
-            self._username_map.pop(info.username, None)
-            print(f"[Server] {info.username} logged out")
-            info.username = ""
+            username = info.username
+            room_id = info.room_id
+        if room_id:
+            self._remove_from_room(username, room_id)
+        with self._lock:
+            info = self._clients.get(cid)
+            if info:
+                info.username = ""
+                info.room_id = ""
+                self._reset_client_audio_state(info)
+            self._username_map.pop(username, None)
+        print(f"[Server] {username} logged out")
 
-    def _handle_disconnect(self, cid):
+    def _handle_disconnect(self, cid) -> None:
         with self._lock:
             info = self._clients.pop(cid, None)
-            if info and info.username:
-                if info.room_id:
-                    self._remove_from_room(info.username, info.room_id)
-                self._username_map.pop(info.username, None)
+            if not info:
+                return
+            username = info.username
+            room_id = info.room_id
+        if username and room_id:
+            self._remove_from_room(username, room_id)
+        if username:
+            with self._lock:
+                self._username_map.pop(username, None)
 
-    # ---- contacts ----
-
-    def _handle_contact_op(self, cid, payload, op):
+    def _handle_contact_op(self, cid, payload, op) -> None:
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
-                self._send_by_cid(cid, encode_response(False, "未登录"))
+                self._send_by_cid(cid, encode_response(False, "not logged in"))
                 return
-            uname = info.username
+            username = info.username
 
         if op == "add":
-            cn = payload.get("contact_name", "")
-            if not cn:
-                self._send_by_cid(cid, encode_response(False, "联系人名称不能为空"))
+            contact_name = payload.get("contact_name", "")
+            if not contact_name:
+                self._send_by_cid(cid, encode_response(False, "empty contact name"))
                 return
-            ok, msg = self._data_store.add_contact(uname, cn)
+            ok, msg = self._data_store.add_contact(username, contact_name)
             self._send_by_cid(cid, encode_response(ok, msg))
         elif op == "delete":
-            cn = payload.get("contact_name", "")
-            ok, msg = self._data_store.delete_contact(uname, cn)
+            contact_name = payload.get("contact_name", "")
+            ok, msg = self._data_store.delete_contact(username, contact_name)
             self._send_by_cid(cid, encode_response(ok, msg))
         elif op == "update":
-            old = payload.get("old_name", "")
-            new = payload.get("new_name", "")
-            if not old or not new:
-                self._send_by_cid(cid, encode_response(False, "联系人名称不能为空"))
+            old_name = payload.get("old_name", "")
+            new_name = payload.get("new_name", "")
+            if not old_name or not new_name:
+                self._send_by_cid(cid, encode_response(False, "empty contact name"))
                 return
-            ok, msg = self._data_store.update_contact(uname, old, new)
+            ok, msg = self._data_store.update_contact(username, old_name, new_name)
             self._send_by_cid(cid, encode_response(ok, msg))
         elif op == "list":
-            contacts = self._data_store.get_contacts(uname)
+            contacts = self._data_store.get_contacts(username)
             self._send_by_cid(
-                cid, encode_response(True, "获取成功", {"contacts": contacts})
+                cid, encode_response(True, "ok", {"contacts": contacts})
             )
         elif op == "search":
-            kw = payload.get("keyword", "")
-            contacts = self._data_store.search_contacts(uname, kw)
+            keyword = payload.get("keyword", "")
+            contacts = self._data_store.search_contacts(username, keyword)
             self._send_by_cid(
-                cid, encode_response(True, "搜索成功", {"contacts": contacts})
+                cid, encode_response(True, "ok", {"contacts": contacts})
             )
 
-    # ---- online query ----
-
-    def _handle_online_query(self, cid):
-        """返回当前所有在线用户列表"""
+    def _handle_online_query(self, cid) -> None:
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
-                self._send_by_cid(cid, encode_response(False, "未登录"))
+                self._send_by_cid(cid, encode_response(False, "not logged in"))
                 return
             online_users = list(self._username_map.keys())
         self._send_by_cid(
-            cid, encode_response(True, "查询成功", {"online_users": online_users})
+            cid, encode_response(True, "ok", {"online_users": online_users})
         )
 
-    # ---- room ----
+    def _reset_client_audio_state(self, info: ClientInfo) -> None:
+        info.udp_addr = None
+        with info.audio_lock:
+            info.audio_state = ClientAudioState()
 
-    def _handle_room_create(self, cid, payload=None):
-        if payload is None:
-            payload = {}
+    def _build_client_audio_payload(self, info: ClientInfo) -> dict:
+        with info.audio_lock:
+            profile = get_profile_by_name(info.audio_state.profile_name)
+            return {
+                "adaptive_profile": profile.name,
+                "audio_format": profile.audio_format.to_payload(),
+            }
+
+    def _handle_quality_report(self, cid, payload) -> None:
+        room_id = payload.get("room_id", "")
+        with self._lock:
+            info = self._clients.get(cid)
+            if not info or not info.username or info.room_id != room_id:
+                return
+
+        try:
+            delay_ms = max(0.0, float(payload.get("delay_ms", 0.0)))
+            jitter_ms = max(0.0, float(payload.get("jitter_ms", 0.0)))
+            packet_loss_percent = max(
+                0.0, float(payload.get("packet_loss_percent", 0.0))
+            )
+        except (TypeError, ValueError):
+            return
+
+        with info.audio_lock:
+            state = info.audio_state
+            previous_profile = state.profile_name
+            profile = choose_adaptive_profile(
+                delay_ms=delay_ms,
+                jitter_ms=jitter_ms,
+                packet_loss_percent=packet_loss_percent,
+                current_profile_name=previous_profile,
+            )
+            state.delay_ms = delay_ms
+            state.jitter_ms = jitter_ms
+            state.packet_loss_percent = packet_loss_percent
+            state.last_reported_at = time.time()
+            if profile.name != previous_profile:
+                state.profile_name = profile.name
+                for transcoder in state.transcoders.values():
+                    transcoder.update_output_format(profile.audio_format)
+
+        if profile.name != previous_profile:
+            print(
+                f"[Server] Adaptive profile for {info.username}: "
+                f"{previous_profile} -> {profile.name} "
+                f"(delay={delay_ms:.0f}ms, jitter={jitter_ms:.0f}ms, "
+                f"loss={packet_loss_percent:.1f}%)"
+            )
+
+    def _adapt_audio_chunks_for_client(
+        self,
+        target_cid: int,
+        sender: str,
+        raw: bytes,
+        source_format: AudioFormat,
+    ) -> tuple[str, dict, List[tuple[int, int, bytes]]]:
+        with self._lock:
+            info = self._clients.get(target_cid)
+        if not info:
+            default_format = DEFAULT_ADAPTIVE_PROFILE.audio_format.to_payload()
+            return DEFAULT_ADAPTIVE_PROFILE.name, default_format, []
+
+        with info.audio_lock:
+            state = info.audio_state
+            profile = get_profile_by_name(state.profile_name)
+            transcoder = state.transcoders.get(sender)
+            if transcoder is None:
+                transcoder = ReframingAudioTranscoder(profile.audio_format)
+                state.transcoders[sender] = transcoder
+            else:
+                transcoder.update_output_format(profile.audio_format)
+
+            chunks = transcoder.feed(raw, source_format)
+            packet_chunks: List[tuple[int, int, bytes]] = []
+            for chunk in chunks:
+                seq = state.outgoing_seq.get(sender, 0)
+                state.outgoing_seq[sender] = (seq + 1) & 0xFFFFFFFF
+                packet_chunks.append((seq, int(time.time() * 1000), chunk))
+
+        return profile.name, profile.audio_format.to_payload(), packet_chunks
+
+    def _handle_room_create(self, cid, payload=None) -> None:
+        payload = payload or {}
         audio_protocol = payload.get("audio_protocol", "tcp")
         if audio_protocol not in ("tcp", "udp"):
             audio_protocol = "tcp"
@@ -331,199 +450,209 @@ class ConferenceServer:
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
-                self._send_by_cid(cid, encode_response(False, "未登录"))
+                self._send_by_cid(cid, encode_response(False, "not logged in"))
                 return
             if info.room_id:
-                self._send_by_cid(cid, encode_response(False, "您已在聊天室中"))
+                self._send_by_cid(cid, encode_response(False, "already in room"))
                 return
-            creator = info.username
-            rid = uuid.uuid4().hex[:8]
-            room = ChatRoom(room_id=rid, creator=creator, audio_protocol=audio_protocol)
-            pos = room.assign_position(creator)
 
-            # UDP模式：为聊天室创建UDP socket
+            creator = info.username
+            room_id = uuid.uuid4().hex[:8]
+            room = ChatRoom(room_id=room_id, creator=creator, audio_protocol=audio_protocol)
+            position = room.assign_position(creator)
+            info.room_id = room_id
+            self._reset_client_audio_state(info)
+
             if audio_protocol == "udp":
                 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                udp_sock.bind((self._host, 0))  # 绑定随机端口
-                udp_port = udp_sock.getsockname()[1]
-                room.udp_port = udp_port
+                udp_sock.bind((self._host, 0))
+                room.udp_port = udp_sock.getsockname()[1]
                 room._udp_sock = udp_sock
-                # 启动UDP接收转发线程
                 threading.Thread(
-                    target=self._udp_recv_loop, args=(rid,), daemon=True
+                    target=self._udp_recv_loop, args=(room_id,), daemon=True
                 ).start()
-                print(f"[Server] Room {rid} UDP port: {udp_port}")
+                print(f"[Server] Room {room_id} UDP port: {room.udp_port}")
 
-            self._rooms[rid] = room
-            info.room_id = rid
+            self._rooms[room_id] = room
+            profile_data = self._build_client_audio_payload(info)
 
-        resp_data = {"room_id": rid, "position": pos, "audio_protocol": audio_protocol}
+        response_data = {
+            "room_id": room_id,
+            "position": position,
+            "audio_protocol": audio_protocol,
+            **profile_data,
+        }
         if audio_protocol == "udp":
-            resp_data["udp_port"] = room.udp_port
-        print(f"[Server] Room {rid} created by {creator} (audio: {audio_protocol})")
-        self._send_by_cid(
-            cid,
-            encode_response(True, "聊天室创建成功", resp_data),
-        )
-        self._broadcast_member_update(rid)
+            response_data["udp_port"] = room.udp_port
+        self._send_by_cid(cid, encode_response(True, "room created", response_data))
+        print(f"[Server] Room {room_id} created by {creator} (audio: {audio_protocol})")
+        self._broadcast_member_update(room_id)
 
-    def _handle_room_invite(self, cid, payload):
-        rid = payload.get("room_id", "")
+    def _handle_room_invite(self, cid, payload) -> None:
+        room_id = payload.get("room_id", "")
         target = payload.get("target", "")
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
-                self._send_by_cid(cid, encode_response(False, "未登录"))
+                self._send_by_cid(cid, encode_response(False, "not logged in"))
                 return
             inviter = info.username
-            room = self._rooms.get(rid)
+            room = self._rooms.get(room_id)
             if not room:
-                self._send_by_cid(cid, encode_response(False, "聊天室不存在"))
+                self._send_by_cid(cid, encode_response(False, "room not found"))
                 return
             if len(room.members) >= MAX_ROOM_SIZE:
-                self._send_by_cid(cid, encode_response(False, "聊天室已满"))
+                self._send_by_cid(cid, encode_response(False, "room full"))
                 return
             if target in room.members:
-                self._send_by_cid(cid, encode_response(False, f"{target} 已在聊天室中"))
+                self._send_by_cid(cid, encode_response(False, "target already in room"))
                 return
             if target not in self._username_map:
-                self._send_by_cid(cid, encode_response(False, f"{target} 不在线"))
+                self._send_by_cid(cid, encode_response(False, "target offline"))
                 return
-            tcid = self._username_map[target]
-            tinfo = self._clients.get(tcid)
-            if tinfo and tinfo.room_id:
-                self._send_by_cid(
-                    cid, encode_response(False, f"{target} 已在其他聊天室中")
-                )
+            target_cid = self._username_map[target]
+            target_info = self._clients.get(target_cid)
+            if target_info and target_info.room_id:
+                self._send_by_cid(cid, encode_response(False, "target busy"))
                 return
             room.invited.add(target)
-        notify = encode_room_invite_notify(rid, inviter, target)
-        self._send_by_cid(tcid, notify)
-        self._send_by_cid(cid, encode_response(True, f"已邀请 {target}"))
-        print(f"[Server] {inviter} invited {target} to room {rid}")
 
-    def _handle_room_join(self, cid, payload):
-        rid = payload.get("room_id", "")
+        self._send_by_cid(target_cid, encode_room_invite_notify(room_id, inviter, target))
+        self._send_by_cid(cid, encode_response(True, "invite sent"))
+        print(f"[Server] {inviter} invited {target} to room {room_id}")
+
+    def _handle_room_join(self, cid, payload) -> None:
+        room_id = payload.get("room_id", "")
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
-                self._send_by_cid(cid, encode_response(False, "未登录"))
+                self._send_by_cid(cid, encode_response(False, "not logged in"))
                 return
-            uname = info.username
+            username = info.username
             if info.room_id:
-                self._send_by_cid(cid, encode_response(False, "您已在聊天室中"))
+                self._send_by_cid(cid, encode_response(False, "already in room"))
                 return
-            room = self._rooms.get(rid)
+            room = self._rooms.get(room_id)
             if not room:
-                self._send_by_cid(cid, encode_response(False, "聊天室不存在"))
+                self._send_by_cid(cid, encode_response(False, "room not found"))
                 return
-            if uname not in room.invited and uname != room.creator:
-                self._send_by_cid(cid, encode_response(False, "您未被邀请"))
+            if username not in room.invited and username != room.creator:
+                self._send_by_cid(cid, encode_response(False, "not invited"))
                 return
             if len(room.members) >= MAX_ROOM_SIZE:
-                self._send_by_cid(cid, encode_response(False, "聊天室已满"))
+                self._send_by_cid(cid, encode_response(False, "room full"))
                 return
-            pos = room.assign_position(uname)
-            room.invited.discard(uname)
-            info.room_id = rid
-            join_data = {
-                "room_id": rid,
-                "position": pos,
+
+            position = room.assign_position(username)
+            room.invited.discard(username)
+            info.room_id = room_id
+            self._reset_client_audio_state(info)
+            profile_data = self._build_client_audio_payload(info)
+            response_data = {
+                "room_id": room_id,
+                "position": position,
                 "creator": room.creator,
                 "audio_protocol": room.audio_protocol,
+                **profile_data,
             }
             if room.audio_protocol == "udp":
-                join_data["udp_port"] = room.udp_port
-        print(f"[Server] {uname} joined room {rid} at pos {pos}")
-        self._send_by_cid(
-            cid,
-            encode_response(True, "加入聊天室成功", join_data),
-        )
-        self._broadcast_member_update(rid)
+                response_data["udp_port"] = room.udp_port
 
-    def _handle_room_leave(self, cid, payload):
-        rid = payload.get("room_id", "")
+        self._send_by_cid(cid, encode_response(True, "join ok", response_data))
+        print(f"[Server] {username} joined room {room_id} at pos {position}")
+        self._broadcast_member_update(room_id)
+
+    def _handle_room_leave(self, cid, payload) -> None:
+        room_id = payload.get("room_id", "")
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
                 return
-            uname = info.username
-        self._remove_from_room(uname, rid)
-        self._send_by_cid(cid, encode_response(True, "已退出聊天室"))
+            username = info.username
+        self._remove_from_room(username, room_id)
+        self._send_by_cid(cid, encode_response(True, "left room"))
 
-    def _handle_room_dismiss(self, cid, payload):
-        rid = payload.get("room_id", "")
+    def _handle_room_dismiss(self, cid, payload) -> None:
+        room_id = payload.get("room_id", "")
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.username:
                 return
-            uname = info.username
-            room = self._rooms.get(rid)
+            username = info.username
+            room = self._rooms.get(room_id)
             if not room:
-                self._send_by_cid(cid, encode_response(False, "聊天室不存在"))
+                self._send_by_cid(cid, encode_response(False, "room not found"))
                 return
-            if room.creator != uname:
-                self._send_by_cid(
-                    cid, encode_response(False, "只有创建者可以解散聊天室")
-                )
+            if room.creator != username:
+                self._send_by_cid(cid, encode_response(False, "only creator can dismiss"))
                 return
-            dismiss_msg = encode_room_dismissed_notify(rid)
-            for m in list(room.members.keys()):
-                if m in self._username_map:
-                    mc = self._username_map[m]
-                    mi = self._clients.get(mc)
-                    if mi:
-                        mi.room_id = ""
-                        mi.udp_addr = None
-                    self._send_by_cid(mc, dismiss_msg)
-            self._close_room_udp(room)
-            del self._rooms[rid]
-        print(f"[Server] Room {rid} dismissed by {uname}")
 
-    def _remove_from_room(self, username, room_id):
+            dismiss_msg = encode_room_dismissed_notify(room_id)
+            for member in list(room.members.keys()):
+                if member not in self._username_map:
+                    continue
+                member_cid = self._username_map[member]
+                member_info = self._clients.get(member_cid)
+                if member_info:
+                    member_info.room_id = ""
+                    self._reset_client_audio_state(member_info)
+                self._send_by_cid(member_cid, dismiss_msg)
+            self._close_room_udp(room)
+            del self._rooms[room_id]
+
+        print(f"[Server] Room {room_id} dismissed by {username}")
+
+    def _remove_from_room(self, username: str, room_id: str) -> None:
         with self._lock:
             room = self._rooms.get(room_id)
             if not room or username not in room.members:
                 return
+
             if room.creator == username:
-                dm = encode_room_dismissed_notify(room_id)
-                for m in list(room.members.keys()):
-                    if m in self._username_map:
-                        mc = self._username_map[m]
-                        mi = self._clients.get(mc)
-                        if mi:
-                            mi.room_id = ""
-                            mi.udp_addr = None
-                        self._send_by_cid(mc, dm)
+                dismiss_msg = encode_room_dismissed_notify(room_id)
+                for member in list(room.members.keys()):
+                    if member not in self._username_map:
+                        continue
+                    member_cid = self._username_map[member]
+                    member_info = self._clients.get(member_cid)
+                    if member_info:
+                        member_info.room_id = ""
+                        self._reset_client_audio_state(member_info)
+                    self._send_by_cid(member_cid, dismiss_msg)
                 self._close_room_udp(room)
                 del self._rooms[room_id]
                 print(f"[Server] Room {room_id} dismissed (creator left)")
                 return
+
             del room.members[username]
             if username in self._username_map:
-                uc = self._username_map[username]
-                ui = self._clients.get(uc)
-                if ui:
-                    ui.room_id = ""
-                    ui.udp_addr = None
+                user_cid = self._username_map[username]
+                user_info = self._clients.get(user_cid)
+                if user_info:
+                    user_info.room_id = ""
+                    self._reset_client_audio_state(user_info)
+
         print(f"[Server] {username} left room {room_id}")
         self._broadcast_member_update(room_id)
 
-    def _broadcast_member_update(self, rid):
+    def _broadcast_member_update(self, room_id: str) -> None:
         with self._lock:
-            room = self._rooms.get(rid)
+            room = self._rooms.get(room_id)
             if not room:
                 return
             members = room.get_member_list()
             positions = dict(room.members)
-            msg = encode_room_member_update(rid, members, positions)
-            for m in list(room.members.keys()):
-                if m in self._username_map:
-                    self._send_by_cid(self._username_map[m], msg)
+            msg = encode_room_member_update(room_id, members, positions)
+            recipients = [
+                self._username_map[member]
+                for member in list(room.members.keys())
+                if member in self._username_map
+            ]
+        for target_cid in recipients:
+            self._send_by_cid(target_cid, msg)
 
-    def _forward_room_audio(self, cid, raw):
-        """TCP模式下的音频转发"""
-        recipients = []
+    def _forward_room_audio(self, cid, payload) -> None:
+        recipients: List[int] = []
         with self._lock:
             info = self._clients.get(cid)
             if not info or not info.room_id:
@@ -531,23 +660,41 @@ class ConferenceServer:
             room = self._rooms.get(info.room_id)
             if not room:
                 return
+            room_id = info.room_id
             sender = info.username
-            for m in list(room.members.keys()):
-                if m == sender:
+            for member in list(room.members.keys()):
+                if member == sender:
                     continue
-                if m in self._username_map:
-                    recipients.append(self._username_map[m])
+                if member in self._username_map:
+                    recipients.append(self._username_map[member])
+
+        try:
+            raw = base64.b64decode(payload.get("data", ""))
+        except Exception:
+            return
+        if not raw:
+            return
+
+        source_format = AudioFormat.from_payload(
+            payload.get("audio_format"), CANONICAL_AUDIO_FORMAT
+        )
         for target_cid in recipients:
-            self._send_audio_by_cid(target_cid, raw)
+            profile_name, audio_format, packet_chunks = self._adapt_audio_chunks_for_client(
+                target_cid, sender, raw, source_format
+            )
+            for seq, timestamp_ms, chunk in packet_chunks:
+                msg = encode_room_audio_chunk(
+                    room_id,
+                    sender,
+                    chunk,
+                    seq=seq,
+                    timestamp_ms=timestamp_ms,
+                    audio_format=audio_format,
+                    profile=profile_name,
+                )
+                self._send_audio_by_cid(target_cid, msg)
 
     def _udp_recv_loop(self, room_id: str) -> None:
-        """UDP模式下的音频接收和转发循环
-
-        每个UDP聊天室有一个独立的UDP socket。
-        客户端发送的UDP数据包格式由 conference_protocol 编解码，
-        包含用户名、音频序号和发送时间戳。
-        服务器收到后转发给同一聊天室的其他成员。
-        """
         while self._running:
             with self._lock:
                 room = self._rooms.get(room_id)
@@ -564,50 +711,56 @@ class ConferenceServer:
                 break
 
             try:
-                sender, _, _, audio_data = decode_udp_audio_packet(data)
+                sender, _, _, audio_data, audio_format = decode_udp_audio_packet(data)
             except ValueError:
                 continue
             if not sender or not audio_data:
                 continue
 
-            recipients = []
+            recipients: List[Tuple[int, Tuple[str, int]]] = []
             with self._lock:
                 room = self._rooms.get(room_id)
                 if not room or not room._udp_sock:
                     break
 
-                # 记录发送者的UDP地址
                 if sender in self._username_map:
-                    scid = self._username_map[sender]
-                    sinfo = self._clients.get(scid)
-                    if sinfo:
-                        sinfo.udp_addr = addr
+                    sender_cid = self._username_map[sender]
+                    sender_info = self._clients.get(sender_cid)
+                    if sender_info:
+                        sender_info.udp_addr = addr
 
-                # 转发给其他成员
-                for m in list(room.members.keys()):
-                    if m == sender:
+                for member in list(room.members.keys()):
+                    if member == sender or member not in self._username_map:
                         continue
-                    if m in self._username_map:
-                        mcid = self._username_map[m]
-                        minfo = self._clients.get(mcid)
-                        if minfo and minfo.udp_addr:
-                            recipients.append(minfo.udp_addr)
+                    member_cid = self._username_map[member]
+                    member_info = self._clients.get(member_cid)
+                    if member_info and member_info.udp_addr:
+                        recipients.append((member_cid, member_info.udp_addr))
 
-            for target_addr in recipients:
-                self._send_udp_audio(udp_sock, data, target_addr)
+            source_format = AudioFormat.from_payload(audio_format, CANONICAL_AUDIO_FORMAT)
+            for target_cid, target_addr in recipients:
+                _, target_audio_format, packet_chunks = self._adapt_audio_chunks_for_client(
+                    target_cid, sender, audio_data, source_format
+                )
+                for seq, timestamp_ms, chunk in packet_chunks:
+                    packet = encode_udp_audio_packet(
+                        sender,
+                        chunk,
+                        seq=seq,
+                        timestamp_ms=timestamp_ms,
+                        audio_format=target_audio_format,
+                    )
+                    self._send_udp_audio(udp_sock, packet, target_addr)
 
         print(f"[Server] UDP recv loop for room {room_id} stopped")
 
     def _close_room_udp(self, room: ChatRoom) -> None:
-        """关闭聊天室的UDP socket"""
         if room._udp_sock:
             try:
                 room._udp_sock.close()
             except Exception:
                 pass
             room._udp_sock = None
-
-    # ---- network ----
 
     def _should_drop_audio(self) -> bool:
         return (
@@ -646,27 +799,29 @@ class ConferenceServer:
         timer.daemon = True
         timer.start()
 
-    def _send(self, conn, msg):
+    def _send(self, conn: socket.socket, msg: str) -> None:
         try:
             conn.sendall((msg + MESSAGE_DELIMITER).encode("utf-8"))
         except Exception:
             pass
 
-    def _send_by_cid(self, cid, msg):
+    def _send_by_cid(self, cid, msg: str) -> None:
         with self._lock:
             info = self._clients.get(cid)
-            if info:
-                self._send(info.conn, msg)
+        if not info:
+            return
+        with info.send_lock:
+            self._send(info.conn, msg)
 
 
-def main():
+def main() -> None:
     server = ConferenceServer()
     try:
         print("=" * 50)
-        print("任务5 - 多方语音会议系统服务器")
+        print("Task 5 - Multi-party Voice Conference Server")
         print("=" * 50)
-        print(f"端口: {DEFAULT_PORT}")
-        print("Ctrl+C 停止")
+        print(f"Port: {DEFAULT_PORT}")
+        print("Ctrl+C to stop")
         server.start()
     except KeyboardInterrupt:
         server.stop()

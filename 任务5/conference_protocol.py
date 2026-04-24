@@ -1,31 +1,20 @@
 """
-任务5：多方语音会议系统应用层协议
+Application-layer protocol helpers for task 5.
 
-在任务4协议基础上扩展，增加聊天室相关消息类型。
-消息统一使用 JSON 文本，以换行符('\n')作为分隔。
-
-新增消息类型：
-- room_create: 创建聊天室
-- room_invite: 邀请用户加入聊天室
-- room_invite_notify: 通知被邀请用户
-- room_join: 用户加入聊天室
-- room_leave: 用户退出聊天室
-- room_dismiss: 解散聊天室
-- room_dismissed_notify: 通知聊天室已被解散
-- room_member_update: 聊天室成员变更通知
-- room_audio_chunk: 聊天室音频数据块
-- online_query: 查询在线用户列表
+Task 5 extends the task 4 JSON control protocol with multi-party room control,
+audio transport metadata, and client quality feedback.
 """
+
+from __future__ import annotations
 
 import base64
 import json
 import struct
 import time
-from typing import Literal, Optional, List
+from typing import List, Literal, Optional
 
-# 消息类型定义（包含任务4的所有类型 + 新增聊天室类型）
+
 MessageType = Literal[
-    # 任务4原有类型
     "login",
     "logout",
     "contact_add",
@@ -41,7 +30,7 @@ MessageType = Literal[
     "call_not_found",
     "text",
     "audio_chunk",
-    # 任务5新增类型
+    "response",
     "room_create",
     "room_invite",
     "room_invite_notify",
@@ -52,32 +41,28 @@ MessageType = Literal[
     "room_member_update",
     "room_audio_chunk",
     "online_query",
+    "quality_report",
 ]
 
+
 MESSAGE_DELIMITER = "\n"
-MAX_ROOM_SIZE = 20  # 每个聊天室最多容纳20个用户
+MAX_ROOM_SIZE = 20
+
 UDP_AUDIO_MAGIC = b"CN5A"
+UDP_AUDIO_MAGIC_V2 = b"CN5B"
 UDP_AUDIO_USERNAME_BYTES = 32
 _UDP_AUDIO_HEADER = struct.Struct("!4s32sIQ")
+_UDP_AUDIO_HEADER_V2 = struct.Struct("!4s32sIQIBBH")
 UDP_AUDIO_HEADER_SIZE = _UDP_AUDIO_HEADER.size
-
-
-# ========== 聊天室消息编码函数 ==========
+UDP_AUDIO_HEADER_V2_SIZE = _UDP_AUDIO_HEADER_V2.size
 
 
 def encode_room_create(creator: str, audio_protocol: str = "tcp") -> str:
-    """编码创建聊天室请求
-
-    Args:
-        creator: 创建者用户名
-        audio_protocol: 音频传输协议，"tcp" 或 "udp"
-    """
     msg = {"type": "room_create", "creator": creator, "audio_protocol": audio_protocol}
     return json.dumps(msg, ensure_ascii=False)
 
 
 def encode_room_invite(room_id: str, inviter: str, target: str) -> str:
-    """编码邀请用户加入聊天室"""
     msg = {
         "type": "room_invite",
         "room_id": room_id,
@@ -88,7 +73,6 @@ def encode_room_invite(room_id: str, inviter: str, target: str) -> str:
 
 
 def encode_room_invite_notify(room_id: str, inviter: str, target: str) -> str:
-    """编码邀请通知（发送给被邀请者）"""
     msg = {
         "type": "room_invite_notify",
         "room_id": room_id,
@@ -99,25 +83,21 @@ def encode_room_invite_notify(room_id: str, inviter: str, target: str) -> str:
 
 
 def encode_room_join(room_id: str, username: str) -> str:
-    """编码加入聊天室"""
     msg = {"type": "room_join", "room_id": room_id, "username": username}
     return json.dumps(msg, ensure_ascii=False)
 
 
 def encode_room_leave(room_id: str, username: str) -> str:
-    """编码退出聊天室"""
     msg = {"type": "room_leave", "room_id": room_id, "username": username}
     return json.dumps(msg, ensure_ascii=False)
 
 
 def encode_room_dismiss(room_id: str, creator: str) -> str:
-    """编码解散聊天室"""
     msg = {"type": "room_dismiss", "room_id": room_id, "creator": creator}
     return json.dumps(msg, ensure_ascii=False)
 
 
 def encode_room_dismissed_notify(room_id: str) -> str:
-    """编码聊天室已被解散通知"""
     msg = {"type": "room_dismissed_notify", "room_id": room_id}
     return json.dumps(msg, ensure_ascii=False)
 
@@ -125,11 +105,6 @@ def encode_room_dismissed_notify(room_id: str) -> str:
 def encode_room_member_update(
     room_id: str, members: List[dict], positions: dict
 ) -> str:
-    """
-    编码聊天室成员变更通知
-    members: [{"username": str, "position": int}, ...]
-    positions: {username: position_index, ...}
-    """
     msg = {
         "type": "room_member_update",
         "room_id": room_id,
@@ -145,8 +120,9 @@ def encode_room_audio_chunk(
     raw: bytes,
     seq: Optional[int] = None,
     timestamp_ms: Optional[int] = None,
+    audio_format: Optional[dict] = None,
+    profile: Optional[str] = None,
 ) -> str:
-    """编码聊天室音频数据块"""
     if not raw:
         raise ValueError("audio chunk is empty")
     msg = {
@@ -159,7 +135,11 @@ def encode_room_audio_chunk(
         msg["seq"] = int(seq)
     if timestamp_ms is not None:
         msg["timestamp_ms"] = int(timestamp_ms)
-    return json.dumps(msg)
+    if audio_format:
+        msg["audio_format"] = dict(audio_format)
+    if profile:
+        msg["profile"] = profile
+    return json.dumps(msg, ensure_ascii=False)
 
 
 def encode_udp_audio_packet(
@@ -167,15 +147,33 @@ def encode_udp_audio_packet(
     raw: bytes,
     seq: int = 0,
     timestamp_ms: Optional[int] = None,
+    audio_format: Optional[dict] = None,
 ) -> bytes:
-    """编码UDP音频包，包含用户名、序号和发送时间。"""
     if not raw:
         raise ValueError("audio chunk is empty")
     if timestamp_ms is None:
         timestamp_ms = int(time.time() * 1000)
+
     username_bytes = sender.encode("utf-8")[:UDP_AUDIO_USERNAME_BYTES].ljust(
         UDP_AUDIO_USERNAME_BYTES, b"\x00"
     )
+    if audio_format:
+        sample_rate = int(audio_format.get("sample_rate", 16000))
+        channels = int(audio_format.get("channels", 1))
+        sample_width = int(audio_format.get("sample_width", 2))
+        chunk_size = int(audio_format.get("chunk_size", 1024))
+        header = _UDP_AUDIO_HEADER_V2.pack(
+            UDP_AUDIO_MAGIC_V2,
+            username_bytes,
+            int(seq) & 0xFFFFFFFF,
+            int(timestamp_ms),
+            sample_rate,
+            channels,
+            sample_width,
+            chunk_size,
+        )
+        return header + raw
+
     header = _UDP_AUDIO_HEADER.pack(
         UDP_AUDIO_MAGIC, username_bytes, int(seq) & 0xFFFFFFFF, int(timestamp_ms)
     )
@@ -183,13 +181,32 @@ def encode_udp_audio_packet(
 
 
 def decode_udp_audio_packet(packet: bytes) -> tuple:
-    """解析UDP音频包，兼容旧的32字节用户名头格式。"""
+    if len(packet) >= UDP_AUDIO_HEADER_V2_SIZE and packet[:4] == UDP_AUDIO_MAGIC_V2:
+        (
+            _,
+            username_bytes,
+            seq,
+            timestamp_ms,
+            sample_rate,
+            channels,
+            sample_width,
+            chunk_size,
+        ) = _UDP_AUDIO_HEADER_V2.unpack(packet[:UDP_AUDIO_HEADER_V2_SIZE])
+        sender = username_bytes.rstrip(b"\x00").decode("utf-8", errors="ignore")
+        audio_format = {
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "sample_width": sample_width,
+            "chunk_size": chunk_size,
+        }
+        return sender, seq, timestamp_ms, packet[UDP_AUDIO_HEADER_V2_SIZE:], audio_format
+
     if len(packet) >= UDP_AUDIO_HEADER_SIZE and packet[:4] == UDP_AUDIO_MAGIC:
         _, username_bytes, seq, timestamp_ms = _UDP_AUDIO_HEADER.unpack(
             packet[:UDP_AUDIO_HEADER_SIZE]
         )
         sender = username_bytes.rstrip(b"\x00").decode("utf-8", errors="ignore")
-        return sender, seq, timestamp_ms, packet[UDP_AUDIO_HEADER_SIZE:]
+        return sender, seq, timestamp_ms, packet[UDP_AUDIO_HEADER_SIZE:], None
 
     if len(packet) >= UDP_AUDIO_USERNAME_BYTES:
         sender = (
@@ -197,21 +214,34 @@ def decode_udp_audio_packet(packet: bytes) -> tuple:
             .rstrip(b"\x00")
             .decode("utf-8", errors="ignore")
         )
-        return sender, None, None, packet[UDP_AUDIO_USERNAME_BYTES:]
+        return sender, None, None, packet[UDP_AUDIO_USERNAME_BYTES:], None
 
     raise ValueError("invalid udp audio packet")
 
 
-# ========== 在线状态查询 ==========
-
-
 def encode_online_query(username: str) -> str:
-    """编码查询在线用户列表请求"""
     msg = {"type": "online_query", "username": username}
     return json.dumps(msg, ensure_ascii=False)
 
 
-# ========== 复用任务4的编码函数 ==========
+def encode_quality_report(
+    room_id: str,
+    username: str,
+    delay_ms: float,
+    jitter_ms: float,
+    packet_loss_percent: float,
+    sample_count: int = 0,
+) -> str:
+    msg = {
+        "type": "quality_report",
+        "room_id": room_id,
+        "username": username,
+        "delay_ms": float(delay_ms),
+        "jitter_ms": float(jitter_ms),
+        "packet_loss_percent": float(packet_loss_percent),
+        "sample_count": int(sample_count),
+    }
+    return json.dumps(msg, ensure_ascii=False)
 
 
 def encode_login(username: str) -> str:
@@ -261,8 +291,6 @@ def encode_response(success: bool, message: str, data: Optional[dict] = None) ->
     return json.dumps(msg, ensure_ascii=False)
 
 
-# ========== 解码函数 ==========
-
 VALID_TYPES = (
     "login",
     "logout",
@@ -290,35 +318,30 @@ VALID_TYPES = (
     "room_member_update",
     "room_audio_chunk",
     "online_query",
+    "quality_report",
 )
 
 
 def decode_message(raw: str) -> tuple:
-    """
-    解析消息，返回(type, payload)。
-    对不合法的消息抛出 ValueError。
-    """
     if not raw:
         raise ValueError("empty message")
     try:
         obj = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"invalid json: {e}") from e
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid json: {exc}") from exc
 
     if not isinstance(obj, dict):
         raise ValueError("message is not a dict")
 
-    t = obj.get("type")
-    if t is None:
+    message_type = obj.get("type")
+    if message_type is None:
         raise ValueError("message has no type field")
-
-    if t not in VALID_TYPES:
-        raise ValueError(f"unknown type: {t}")
-    return t, obj
+    if message_type not in VALID_TYPES:
+        raise ValueError(f"unknown type: {message_type}")
+    return message_type, obj
 
 
 def decode_response(raw: str) -> tuple:
-    """解析响应消息"""
     obj = json.loads(raw)
     success = obj.get("success", False)
     message = obj.get("message", "")
