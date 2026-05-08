@@ -1,5 +1,5 @@
 """
-任务5 - 多方语音会议系统客户端
+SEU Meeting - 多方语音会议系统客户端
 
 在任务4客户端基础上扩展，增加聊天室功能。
 """
@@ -257,7 +257,9 @@ class ConferenceClient:
         return self._volume_levels.copy()
 
     def get_active_receive_audio_description(self) -> str:
-        return f"{self._active_receive_profile}: {self._active_receive_format.describe()}"
+        return (
+            f"{self._active_receive_profile}: {self._active_receive_format.describe()}"
+        )
 
     def reset_quality_stats(self) -> None:
         self._quality_monitor.reset()
@@ -268,7 +270,9 @@ class ConferenceClient:
         active = set(active_members)
         with self._incoming_audio_lock:
             stale = [
-                sender for sender in list(self._incoming_audio.keys()) if sender not in active
+                sender
+                for sender in list(self._incoming_audio.keys())
+                if sender not in active
             ]
             for sender in stale:
                 self._incoming_audio.pop(sender, None)
@@ -367,9 +371,7 @@ class ConferenceClient:
         if not self._ensure_connected():
             return False, "无法连接到服务器"
         self._setup_private_call_media()
-        self._send_raw(
-            encode_login(username, self._call_media_port, self._local_ip)
-        )
+        self._send_raw(encode_login(username, self._call_media_port, self._local_ip))
         success, message = self._sync_wait_response()
         if success:
             self._username = username
@@ -851,9 +853,13 @@ class ConferenceClient:
                 break
             if data and self._out_stream:
                 try:
-                    sender, seq, timestamp_ms, audio_data, audio_format = decode_udp_audio_packet(data)
+                    sender, seq, timestamp_ms, audio_data, audio_format = (
+                        decode_udp_audio_packet(data)
+                    )
                     if audio_data:
-                        receive_format = self._update_receive_audio_profile(audio_format)
+                        receive_format = self._update_receive_audio_profile(
+                            audio_format
+                        )
                         self._record_audio_quality(sender, seq, timestamp_ms)
                         self._enqueue_received_audio(sender, audio_data, receive_format)
                 except Exception:
@@ -978,7 +984,9 @@ class ConferenceClient:
                 next_play_time = self._call_next_play_time
                 has_frames = bool(self._call_jitter_buffer)
 
-            if expected is None or (not has_frames and self._call_state != CallState.IN_CALL):
+            if expected is None or (
+                not has_frames and self._call_state != CallState.IN_CALL
+            ):
                 time.sleep(0.01)
                 continue
 
@@ -1004,8 +1012,13 @@ class ConferenceClient:
             frame = self._call_jitter_buffer.pop(self._call_expected_sequence, None)
             now = time.monotonic()
             if frame is None:
-                min_seq = min(self._call_jitter_buffer) if self._call_jitter_buffer else None
-                if min_seq is None and now < self._call_next_play_time + CALL_MISSING_GRACE_SEC:
+                min_seq = (
+                    min(self._call_jitter_buffer) if self._call_jitter_buffer else None
+                )
+                if (
+                    min_seq is None
+                    and now < self._call_next_play_time + CALL_MISSING_GRACE_SEC
+                ):
                     return None
                 if min_seq is not None and min_seq > self._call_expected_sequence:
                     raw = self._conceal_missing_call_frame_locked()
@@ -1362,7 +1375,9 @@ class ConferenceClient:
             self._in_call_with = peer
             self._call_id = str(payload.get("call_id", "")).strip()
             self._session_mode = str(payload.get("mode", "")).strip() or "negotiating"
-            self._peer_media_addr = (peer_ip, peer_port) if peer_ip and peer_port else None
+            self._peer_media_addr = (
+                (peer_ip, peer_port) if peer_ip and peer_port else None
+            )
             self._relay_media_addr = (self._server_ip or self._host, relay_port)
             self._direct_path_reported = False
             self._reset_call_jitter_buffer()
@@ -1383,25 +1398,33 @@ class ConferenceClient:
         if mtype == "call_reject":
             self._clear_private_call_session(reset_state=True)
             self._set_call_state(CallState.ENDED, "")
-            threading.Timer(1.0, lambda: self._set_call_state(CallState.IDLE, "")).start()
+            threading.Timer(
+                1.0, lambda: self._set_call_state(CallState.IDLE, "")
+            ).start()
             return
 
         if mtype == "call_busy":
             self._clear_private_call_session(reset_state=True)
             self._set_call_state(CallState.ENDED, "")
-            threading.Timer(1.0, lambda: self._set_call_state(CallState.IDLE, "")).start()
+            threading.Timer(
+                1.0, lambda: self._set_call_state(CallState.IDLE, "")
+            ).start()
             return
 
         if mtype == "call_not_found":
             self._clear_private_call_session(reset_state=True)
             self._set_call_state(CallState.ENDED, "")
-            threading.Timer(1.0, lambda: self._set_call_state(CallState.IDLE, "")).start()
+            threading.Timer(
+                1.0, lambda: self._set_call_state(CallState.IDLE, "")
+            ).start()
             return
 
         if mtype == "call_hangup":
             self._clear_private_call_session(reset_state=True)
             self._set_call_state(CallState.ENDED, "")
-            threading.Timer(1.0, lambda: self._set_call_state(CallState.IDLE, "")).start()
+            threading.Timer(
+                1.0, lambda: self._set_call_state(CallState.IDLE, "")
+            ).start()
             return
 
         if mtype == "media_stop":

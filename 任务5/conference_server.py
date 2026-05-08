@@ -1,5 +1,5 @@
 """
-Task 5 conference server with per-client adaptive downstream audio delivery.
+SEU Meeting conference server with per-client adaptive downstream audio delivery.
 """
 
 from __future__ import annotations
@@ -54,7 +54,6 @@ def _ensure_task4_on_path() -> None:
 _ensure_task4_on_path()
 
 from data_store import get_data_store
-
 
 DEFAULT_PORT = 8882
 NEGOTIATION_TIMEOUT_SEC = 1.6
@@ -161,7 +160,9 @@ class ChatRoom:
     def get_member_list(self) -> List[dict]:
         return [
             {"username": username, "position": position}
-            for username, position in sorted(self.members.items(), key=lambda item: item[1])
+            for username, position in sorted(
+                self.members.items(), key=lambda item: item[1]
+            )
         ]
 
 
@@ -418,15 +419,11 @@ class ConferenceServer:
             self._send_by_cid(cid, encode_response(ok, msg))
         elif op == "list":
             contacts = self._data_store.get_contacts(username)
-            self._send_by_cid(
-                cid, encode_response(True, "ok", {"contacts": contacts})
-            )
+            self._send_by_cid(cid, encode_response(True, "ok", {"contacts": contacts}))
         elif op == "search":
             keyword = payload.get("keyword", "")
             contacts = self._data_store.search_contacts(username, keyword)
-            self._send_by_cid(
-                cid, encode_response(True, "ok", {"contacts": contacts})
-            )
+            self._send_by_cid(cid, encode_response(True, "ok", {"contacts": contacts}))
 
     def _handle_online_query(self, cid) -> None:
         with self._lock:
@@ -521,7 +518,9 @@ class ConferenceServer:
                 self._send_by_cid(cid, encode_response(False, "cannot call yourself"))
                 return
             if caller_info.room_id:
-                self._send_by_cid(cid, encode_response(False, "leave room before private call"))
+                self._send_by_cid(
+                    cid, encode_response(False, "leave room before private call")
+                )
                 return
             if self._is_private_call_busy(caller_info):
                 self._send_by_cid(cid, encode_response(False, "caller is busy"))
@@ -558,10 +557,15 @@ class ConferenceServer:
                 self._send_by_cid(cid, encode_call_not_found(caller))
                 return
             if callee_info.room_id or caller_info.room_id:
-                self._send_by_cid(cid, encode_response(False, "room members cannot start private calls"))
+                self._send_by_cid(
+                    cid,
+                    encode_response(False, "room members cannot start private calls"),
+                )
                 return
             if callee_info.pending_peer != caller or caller_info.pending_peer != callee:
-                self._send_by_cid(cid, encode_response(False, "no matching pending call"))
+                self._send_by_cid(
+                    cid, encode_response(False, "no matching pending call")
+                )
                 return
 
             call_id = uuid.uuid4().hex
@@ -630,7 +634,11 @@ class ConferenceServer:
             if not info or not info.username:
                 return
             username = info.username
-            target = str(payload.get("target", "")).strip() or info.in_call_with or info.pending_peer
+            target = (
+                str(payload.get("target", "")).strip()
+                or info.in_call_with
+                or info.pending_peer
+            )
 
         self._end_call(username, target)
 
@@ -682,7 +690,10 @@ class ConferenceServer:
                 call_id = user_info.call_id
                 self._reset_client_call_state(user_info)
             if target_info:
-                if target_info.pending_peer == username or target_info.in_call_with == username:
+                if (
+                    target_info.pending_peer == username
+                    or target_info.in_call_with == username
+                ):
                     call_id = call_id or target_info.call_id
                     self._reset_client_call_state(target_info)
 
@@ -786,13 +797,16 @@ class ConferenceServer:
                 return
             if self._is_private_call_busy(info):
                 self._send_by_cid(
-                    cid, encode_response(False, "finish private call before creating room")
+                    cid,
+                    encode_response(False, "finish private call before creating room"),
                 )
                 return
 
             creator = info.username
             room_id = uuid.uuid4().hex[:8]
-            room = ChatRoom(room_id=room_id, creator=creator, audio_protocol=audio_protocol)
+            room = ChatRoom(
+                room_id=room_id, creator=creator, audio_protocol=audio_protocol
+            )
             position = room.assign_position(creator)
             info.room_id = room_id
             self._reset_client_audio_state(info)
@@ -851,12 +865,16 @@ class ConferenceServer:
                 return
             target_cid = self._username_map[target]
             target_info = self._clients.get(target_cid)
-            if target_info and (target_info.room_id or self._is_private_call_busy(target_info)):
+            if target_info and (
+                target_info.room_id or self._is_private_call_busy(target_info)
+            ):
                 self._send_by_cid(cid, encode_response(False, "target busy"))
                 return
             room.invited.add(target)
 
-        self._send_by_cid(target_cid, encode_room_invite_notify(room_id, inviter, target))
+        self._send_by_cid(
+            target_cid, encode_room_invite_notify(room_id, inviter, target)
+        )
         self._send_by_cid(cid, encode_response(True, "invite sent"))
         print(f"[Server] {inviter} invited {target} to room {room_id}")
 
@@ -873,7 +891,8 @@ class ConferenceServer:
                 return
             if self._is_private_call_busy(info):
                 self._send_by_cid(
-                    cid, encode_response(False, "finish private call before joining room")
+                    cid,
+                    encode_response(False, "finish private call before joining room"),
                 )
                 return
             room = self._rooms.get(room_id)
@@ -928,7 +947,9 @@ class ConferenceServer:
                 self._send_by_cid(cid, encode_response(False, "room not found"))
                 return
             if room.creator != username:
-                self._send_by_cid(cid, encode_response(False, "only creator can dismiss"))
+                self._send_by_cid(
+                    cid, encode_response(False, "only creator can dismiss")
+                )
                 return
 
             dismiss_msg = encode_room_dismissed_notify(room_id)
@@ -1023,8 +1044,10 @@ class ConferenceServer:
             payload.get("audio_format"), CANONICAL_AUDIO_FORMAT
         )
         for target_cid in recipients:
-            profile_name, audio_format, packet_chunks = self._adapt_audio_chunks_for_client(
-                target_cid, sender, raw, source_format
+            profile_name, audio_format, packet_chunks = (
+                self._adapt_audio_chunks_for_client(
+                    target_cid, sender, raw, source_format
+                )
             )
             for seq, timestamp_ms, chunk in packet_chunks:
                 msg = encode_room_audio_chunk(
@@ -1081,10 +1104,14 @@ class ConferenceServer:
                     if member_info and member_info.udp_addr:
                         recipients.append((member_cid, member_info.udp_addr))
 
-            source_format = AudioFormat.from_payload(audio_format, CANONICAL_AUDIO_FORMAT)
+            source_format = AudioFormat.from_payload(
+                audio_format, CANONICAL_AUDIO_FORMAT
+            )
             for target_cid, target_addr in recipients:
-                _, target_audio_format, packet_chunks = self._adapt_audio_chunks_for_client(
-                    target_cid, sender, audio_data, source_format
+                _, target_audio_format, packet_chunks = (
+                    self._adapt_audio_chunks_for_client(
+                        target_cid, sender, audio_data, source_format
+                    )
                 )
                 for seq, timestamp_ms, chunk in packet_chunks:
                     packet = encode_udp_audio_packet(
@@ -1211,7 +1238,7 @@ def main() -> None:
     server = ConferenceServer()
     try:
         print("=" * 50)
-        print("Task 5 - Multi-party Voice Conference Server")
+        print("SEU Meeting - Multi-party Voice Conference Server")
         print("=" * 50)
         print(f"Port: {DEFAULT_PORT}")
         print("Ctrl+C to stop")

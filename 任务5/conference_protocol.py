@@ -1,7 +1,7 @@
 """
-Application-layer protocol helpers for task 5.
+Application-layer protocol helpers for SEU Meeting.
 
-Task 5 extends the task 4 JSON control protocol with multi-party room control,
+SEU Meeting extends the task 4 JSON control protocol with multi-party room control,
 audio transport metadata, and client quality feedback.
 """
 
@@ -12,7 +12,6 @@ import json
 import struct
 import time
 from typing import List, Literal, Optional
-
 
 MessageType = Literal[
     "login",
@@ -205,7 +204,13 @@ def decode_udp_audio_packet(packet: bytes) -> tuple:
             "sample_width": sample_width,
             "chunk_size": chunk_size,
         }
-        return sender, seq, timestamp_ms, packet[UDP_AUDIO_HEADER_V2_SIZE:], audio_format
+        return (
+            sender,
+            seq,
+            timestamp_ms,
+            packet[UDP_AUDIO_HEADER_V2_SIZE:],
+            audio_format,
+        )
 
     if len(packet) >= UDP_AUDIO_HEADER_SIZE and packet[:4] == UDP_AUDIO_MAGIC:
         _, username_bytes, seq, timestamp_ms = _UDP_AUDIO_HEADER.unpack(
@@ -250,9 +255,7 @@ def encode_quality_report(
     return json.dumps(msg, ensure_ascii=False)
 
 
-def encode_login(
-    username: str, media_port: int = 0, local_ip: str = ""
-) -> str:
+def encode_login(username: str, media_port: int = 0, local_ip: str = "") -> str:
     msg = {"type": "login", "username": username}
     if media_port > 0:
         msg["media_port"] = int(media_port)

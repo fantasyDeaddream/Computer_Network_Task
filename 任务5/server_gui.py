@@ -1,5 +1,5 @@
 """
-任务5 - 多方语音会议系统服务器图形界面
+SEU Meeting - 多方语音会议系统服务器图形界面
 """
 
 import queue
@@ -28,7 +28,7 @@ class ServerGUI(ttk.Window):
 
     def __init__(self):
         super().__init__(themename="litera")
-        self.title("任务5 - 多方语音会议系统服务器")
+        self.title("SEU Meeting - 多方语音会议系统服务器")
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
         width = int(screen_width * 0.7)
@@ -93,7 +93,7 @@ class ServerGUI(ttk.Window):
         self.log_text = tk.Text(log, wrap="word", height=20)
         self.log_text.pack(fill="both", expand=True)
 
-        hint = "说明：本窗口启动的是任务5实现的多方语音会议系统服务器。"
+        hint = "说明：本窗口启动的是 SEU Meeting 实现的多方语音会议系统服务器。"
         ttk.Label(outer, text=hint, justify="left").pack(anchor="w", pady=(10, 0))
 
     def _set_lamp(self, color):

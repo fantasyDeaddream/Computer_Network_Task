@@ -1,5 +1,5 @@
 """
-任务5 客户端启动器
+SEU Meeting 客户端启动器
 """
 
 from client_gui import run_app

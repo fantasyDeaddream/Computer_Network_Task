@@ -1,5 +1,5 @@
 """
-任务5 - 多方语音会议系统客户端图形界面
+SEU Meeting - 多方语音会议系统客户端图形界面
 
 复用任务4的登录界面和联系人界面（不做修改），
 修改IP电话界面（删除用户输入框，呼叫改为创建聊天室），
@@ -43,7 +43,7 @@ class LoginFrame(ttk.Frame):
         self._build_ui()
 
     def _build_ui(self):
-        title = ttk.Label(self, text="IP电话系统 - 登录", font=("微软雅黑", 16))
+        title = ttk.Label(self, text="SEU Meeting - 登录", font=("微软雅黑", 16))
         title.pack(pady=20)
 
         server_box = ttk.Labelframe(self, text="服务器配置", padding=10)
@@ -107,7 +107,7 @@ class LoginFrame(ttk.Frame):
 
 
 # ============================================================
-# ContactFrame - 复用任务4的联系人界面（撤销双击呼叫功能）
+# ContactFrame - 复用任务4的联系人界面（SEU Meeting 撤销双击呼叫功能）
 # 新增：显示联系人在线/离线状态
 # ============================================================
 class ContactFrame(ttk.Frame):
@@ -178,7 +178,7 @@ class ContactFrame(ttk.Frame):
         )
         scrollbar.pack(side="right", fill="y")
         self.contact_listbox.config(yscrollcommand=scrollbar.set)
-        # 注意：不绑定双击呼叫事件（任务5撤销此功能）
+        # 注意：不绑定双击呼叫事件（SEU Meeting 撤销此功能）
 
     def _get_raw_name(self, display_text: str) -> str:
         """从列表显示文本中提取原始用户名（去掉在线状态前缀）"""
@@ -296,8 +296,7 @@ class AvatarSelectorFrame(ttk.Frame):
         scrollable_frame = ttk.Frame(canvas)
 
         scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
@@ -321,8 +320,14 @@ class AvatarSelectorFrame(ttk.Frame):
                 img = tk.PhotoImage(file=str(avatar_path))
                 orig_w = img.width()
                 orig_h = img.height()
-                if orig_w > self.AVATAR_DISPLAY_SIZE or orig_h > self.AVATAR_DISPLAY_SIZE:
-                    factor = max(orig_w // self.AVATAR_DISPLAY_SIZE, orig_h // self.AVATAR_DISPLAY_SIZE)
+                if (
+                    orig_w > self.AVATAR_DISPLAY_SIZE
+                    or orig_h > self.AVATAR_DISPLAY_SIZE
+                ):
+                    factor = max(
+                        orig_w // self.AVATAR_DISPLAY_SIZE,
+                        orig_h // self.AVATAR_DISPLAY_SIZE,
+                    )
                     img = img.subsample(factor, factor)
 
                 label = ttk.Label(frame, image=img)
@@ -335,14 +340,18 @@ class AvatarSelectorFrame(ttk.Frame):
                         btn_frame.config(relief="ridge")
                     f.config(relief="solid")
 
-                label.bind("<Button-1>", lambda e, p=avatar_path, f=frame: on_select(p, f))
+                label.bind(
+                    "<Button-1>", lambda e, p=avatar_path, f=frame: on_select(p, f)
+                )
                 self._avatar_buttons[avatar_path] = frame
             except Exception as e:
                 print(f"Failed to load avatar: {avatar_path}: {e}")
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(pady=10)
-        ttk.Button(btn_frame, text="确认选择", command=self._on_confirm).pack(side="left", padx=10)
+        ttk.Button(btn_frame, text="确认选择", command=self._on_confirm).pack(
+            side="left", padx=10
+        )
 
         self._status_label = ttk.Label(self, text="", foreground="green")
         self._status_label.pack(pady=5)
@@ -597,9 +606,9 @@ class PrivateCallFrame(ttk.Frame):
         self._status_var = tk.StringVar(value="空闲")
         self._peer_var = tk.StringVar(value="对端: -")
         self._route_var = tk.StringVar(value="链路: -")
-        ttk.Label(status_box, textvariable=self._status_var, font=("微软雅黑", 12)).pack(
-            anchor="w"
-        )
+        ttk.Label(
+            status_box, textvariable=self._status_var, font=("微软雅黑", 12)
+        ).pack(anchor="w")
         ttk.Label(status_box, textvariable=self._peer_var, foreground="gray").pack(
             anchor="w", pady=(4, 0)
         )
@@ -614,9 +623,9 @@ class PrivateCallFrame(ttk.Frame):
         target_entry = ttk.Entry(target_box, textvariable=self._target_var, width=28)
         target_entry.grid(row=0, column=1, sticky="w", padx=(8, 0))
         target_entry.bind("<Return>", lambda _event: self._on_call())
-        ttk.Button(target_box, text="刷新联系人", command=self._refresh_candidates).grid(
-            row=0, column=2, sticky="w", padx=(12, 0)
-        )
+        ttk.Button(
+            target_box, text="刷新联系人", command=self._refresh_candidates
+        ).grid(row=0, column=2, sticky="w", padx=(12, 0))
 
         action_box = ttk.Frame(target_box)
         action_box.grid(row=1, column=0, columnspan=3, sticky="w", pady=(12, 0))
@@ -645,7 +654,9 @@ class PrivateCallFrame(ttk.Frame):
         list_box.pack(fill="both", expand=True, padx=10, pady=5)
         self._candidate_list = tk.Listbox(list_box, height=12)
         self._candidate_list.pack(side="left", fill="both", expand=True)
-        self._candidate_list.bind("<<ListboxSelect>>", lambda _event: self._use_selection())
+        self._candidate_list.bind(
+            "<<ListboxSelect>>", lambda _event: self._use_selection()
+        )
         self._candidate_list.bind("<Double-Button-1>", lambda _event: self._on_call())
         scrollbar = ttk.Scrollbar(
             list_box, orient="vertical", command=self._candidate_list.yview
@@ -733,7 +744,9 @@ class PrivateCallFrame(ttk.Frame):
         }
         if peer != "-" and state in {"ringing", "calling", "connecting", "in_call"}:
             self._target_var.set(peer)
-        route_text = mode_map.get(self._client.session_mode, self._client.session_mode or "-")
+        route_text = mode_map.get(
+            self._client.session_mode, self._client.session_mode or "-"
+        )
         if self._client.is_call_sending and state == "in_call":
             route_text = f"{route_text} | 麦克风发送中"
 
@@ -880,7 +893,12 @@ class ChatRoomFrame(ttk.Frame):
             )
             volume_bar.pack(side="left", padx=(0, 3))
             bar_rect = volume_bar.create_rectangle(
-                1, self.AVATAR_SIZE - 1, 5, self.AVATAR_SIZE - 1, fill="#4caf50", outline=""
+                1,
+                self.AVATAR_SIZE - 1,
+                5,
+                self.AVATAR_SIZE - 1,
+                fill="#4caf50",
+                outline="",
             )
             self._volume_bars[pos] = (volume_bar, bar_rect)
 
@@ -925,11 +943,17 @@ class ChatRoomFrame(ttk.Frame):
         volume_box.pack(fill="x", padx=10, pady=5)
         self._volume_box = ttk.Frame(volume_box)
         self._volume_box.pack(fill="x")
-        ttk.Label(self._volume_box, text="成员", width=12).grid(row=0, column=0, sticky="w")
-        ttk.Label(self._volume_box, text="音量", width=30).grid(row=0, column=1, sticky="w")
+        ttk.Label(self._volume_box, text="成员", width=12).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(self._volume_box, text="音量", width=30).grid(
+            row=0, column=1, sticky="w"
+        )
 
         # E-model通话质量
-        quality_box = ttk.Labelframe(self, text="通话质量 (E-model / G.107)", padding=10)
+        quality_box = ttk.Labelframe(
+            self, text="通话质量 (E-model / G.107)", padding=10
+        )
         quality_box.pack(fill="x", padx=10, pady=5)
         self._quality_box = ttk.Frame(quality_box)
         self._quality_box.pack(fill="x")
@@ -1125,8 +1149,12 @@ class ChatRoomFrame(ttk.Frame):
         self._volume_controls.clear()
         for widget in self._volume_box.winfo_children():
             widget.destroy()
-        ttk.Label(self._volume_box, text="成员", width=12).grid(row=0, column=0, sticky="w")
-        ttk.Label(self._volume_box, text="音量", width=30).grid(row=0, column=1, sticky="w")
+        ttk.Label(self._volume_box, text="成员", width=12).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(self._volume_box, text="音量", width=30).grid(
+            row=0, column=1, sticky="w"
+        )
 
         # 填充成员
         volume_row = 1
@@ -1223,7 +1251,10 @@ class ChatRoomFrame(ttk.Frame):
         widths = (12, 8, 8, 10, 10, 10, 10)
         for col, (header, width) in enumerate(zip(headers, widths)):
             ttk.Label(
-                self._quality_box, text=header, width=width, font=("微软雅黑", 9, "bold")
+                self._quality_box,
+                text=header,
+                width=width,
+                font=("微软雅黑", 9, "bold"),
             ).grid(row=0, column=col, sticky="w", padx=(0, 6))
 
         active_reports = [
@@ -1287,7 +1318,7 @@ class ClientGUI(ttk.Window):
 
     def __init__(self):
         super().__init__(themename="litera")
-        self.title("任务5 - 多方语音会议系统")
+        self.title("SEU Meeting - 多方语音会议系统")
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
         width = int(screen_width * 0.8)
@@ -1344,7 +1375,9 @@ class ClientGUI(ttk.Window):
         )
         self._notebook.add(self._private_call_frame, text="私聊语音")
 
-        self._avatar_selector_frame = AvatarSelectorFrame(self._notebook, self._username)
+        self._avatar_selector_frame = AvatarSelectorFrame(
+            self._notebook, self._username
+        )
         self._notebook.add(self._avatar_selector_frame, text="头像设置")
         self._sync_feature_availability()
 

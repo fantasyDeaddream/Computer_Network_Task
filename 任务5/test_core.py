@@ -1,5 +1,5 @@
 """
-任务5 核心功能测试（不依赖GUI和音频设备）
+SEU Meeting 核心功能测试（不依赖GUI和音频设备）
 """
 
 import threading
@@ -299,7 +299,9 @@ def main():
 
     msgs_b = recv_all(s2)
     adaptive_chunks = [
-        m for m in msgs_b if m.get("type") == "room_audio_chunk" and m.get("sender") == "alice"
+        m
+        for m in msgs_b
+        if m.get("type") == "room_audio_chunk" and m.get("sender") == "alice"
     ]
     assert adaptive_chunks, f"Adaptive room audio not received: {msgs_b}"
     adaptive_format = adaptive_chunks[0].get("audio_format", {})
