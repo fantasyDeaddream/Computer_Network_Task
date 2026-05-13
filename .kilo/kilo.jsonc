@@ -1,0 +1,12 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "mcp": {
+    "markitdown": {
+      "type": "local",
+      "command": [
+        "markitdown-mcp"
+      ],
+      "enabled": true
+    }
+  }
+}

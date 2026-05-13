@@ -1,0 +1,369 @@
+"""
+SEU Meeting 核心功能测试（不依赖GUI和音频设备）
+"""
+
+import threading
+import time
+import socket
+import json
+import sys
+
+
+def send_msg(sock, obj):
+    data = json.dumps(obj, ensure_ascii=False) + "\n"
+    sock.sendall(data.encode("utf-8"))
+
+
+def recv_all(sock, timeout=1.0):
+    sock.settimeout(timeout)
+    buf = ""
+    try:
+        while True:
+            d = sock.recv(4096)
+            if not d:
+                break
+            buf += d.decode("utf-8", errors="ignore")
+    except socket.timeout:
+        pass
+    return [json.loads(l) for l in buf.strip().split("\n") if l.strip()]
+
+
+def main():
+    # 使用非标准端口避免冲突
+    PORT = 18883
+
+    from conference_server import ConferenceServer
+
+    server = ConferenceServer(port=PORT)
+    t = threading.Thread(target=server.start, daemon=True)
+    t.start()
+    time.sleep(0.5)
+
+    results = []
+
+    # --- 测试0: E-model音频元数据助手 ---
+    from conference_protocol import (
+        decode_media_packet,
+        decode_message,
+        encode_audio_frame,
+        decode_udp_audio_packet,
+        encode_room_audio_chunk,
+        encode_quality_report,
+        encode_udp_audio_packet,
+    )
+    from audio_adaptive import CANONICAL_AUDIO_FORMAT
+    from emodel import AudioQualityMonitor, evaluate_quality
+
+    encoded = encode_room_audio_chunk(
+        "r1",
+        "alice",
+        b"abc",
+        seq=7,
+        timestamp_ms=123,
+        audio_format=CANONICAL_AUDIO_FORMAT.to_payload(),
+    )
+    mtype, payload = decode_message(encoded)
+    assert mtype == "room_audio_chunk"
+    assert payload["seq"] == 7 and payload["timestamp_ms"] == 123
+
+    udp_packet = encode_udp_audio_packet(
+        "alice",
+        b"abc",
+        seq=8,
+        timestamp_ms=456,
+        audio_format=CANONICAL_AUDIO_FORMAT.to_payload(),
+    )
+    sender, seq, timestamp_ms, raw, audio_format = decode_udp_audio_packet(udp_packet)
+    assert (sender, seq, timestamp_ms, raw) == ("alice", 8, 456, b"abc")
+    assert audio_format["sample_rate"] == CANONICAL_AUDIO_FORMAT.sample_rate
+
+    quality = evaluate_quality(delay_ms=50, packet_loss_percent=0, jitter_ms=5)
+    assert quality.r_factor > 80 and quality.mos > 4.0
+
+    monitor = AudioQualityMonitor()
+    monitor.observe_packet("alice", 1, 100)
+    monitor.observe_packet("bob", 1, 100)
+    monitor.prune_senders({"alice"})
+    assert set(monitor.get_reports().keys()) == {"alice"}
+    results.append("PASS: E-model helpers")
+
+    # --- 测试1: 登录 ---
+    udp_a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_a.bind(("127.0.0.1", 0))
+    udp_b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_b.bind(("127.0.0.1", 0))
+    udp_a.settimeout(1.0)
+    udp_b.settimeout(1.0)
+
+    s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s1.connect(("localhost", PORT))
+    send_msg(
+        s1,
+        {
+            "type": "login",
+            "username": "alice",
+            "media_port": udp_a.getsockname()[1],
+            "local_ip": "127.0.0.1",
+        },
+    )
+    time.sleep(0.3)
+    msgs = recv_all(s1)
+    assert len(msgs) >= 1 and msgs[0].get("success") is True, f"Login failed: {msgs}"
+    results.append("PASS: Alice login")
+
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s2.connect(("localhost", PORT))
+    send_msg(
+        s2,
+        {
+            "type": "login",
+            "username": "bob",
+            "media_port": udp_b.getsockname()[1],
+            "local_ip": "127.0.0.1",
+        },
+    )
+    time.sleep(0.3)
+    msgs = recv_all(s2)
+    assert len(msgs) >= 1 and msgs[0].get("success") is True, f"Login failed: {msgs}"
+    results.append("PASS: Bob login")
+
+    # --- 测试2: 私聊信号 + 中继/P2P切换 ---
+    send_msg(s1, {"type": "call_invite", "target": "bob"})
+    time.sleep(0.2)
+    msgs_b = recv_all(s2, timeout=0.2)
+    assert any(
+        m.get("type") == "call_invite" and m.get("caller") == "alice" for m in msgs_b
+    ), f"Call invite not received: {msgs_b}"
+    results.append("PASS: Private call invite delivered")
+
+    send_msg(s2, {"type": "call_accept", "caller": "alice"})
+    time.sleep(0.3)
+    msgs_a = recv_all(s1, timeout=0.2)
+    msgs_b = recv_all(s2, timeout=0.2)
+    ready_a = next((m for m in msgs_a if m.get("type") == "call_ready"), None)
+    ready_b = next((m for m in msgs_b if m.get("type") == "call_ready"), None)
+    assert ready_a and ready_b, f"Call ready missing: {msgs_a} / {msgs_b}"
+    assert ready_a.get("mode") == "negotiating", ready_a
+    assert ready_b.get("mode") == "negotiating", ready_b
+    call_id = ready_a["call_id"]
+    results.append("PASS: Private call negotiation started")
+
+    relay_packet = encode_audio_frame(
+        stream_id="stream-a",
+        sequence=1,
+        timestamp_ms=100,
+        sender="alice",
+        target="bob",
+        mode="negotiating",
+        raw=b"\x01\x02" * 320,
+    )
+    udp_a.sendto(relay_packet, ("127.0.0.1", PORT))
+    data, _addr = udp_b.recvfrom(65535)
+    packet_type, media_payload = decode_media_packet(data)
+    assert packet_type == "audio_frame", media_payload
+    assert media_payload.get("sender") == "alice", media_payload
+    results.append("PASS: Private call relay forwarding works during negotiation")
+
+    send_msg(s1, {"type": "direct_path_seen", "call_id": call_id, "target": "bob"})
+    send_msg(s2, {"type": "direct_path_seen", "call_id": call_id, "target": "alice"})
+    time.sleep(0.3)
+    msgs_a = recv_all(s1, timeout=0.2)
+    msgs_b = recv_all(s2, timeout=0.2)
+    assert any(
+        m.get("type") == "transport_update" and m.get("mode") == "p2p" for m in msgs_a
+    ), msgs_a
+    assert any(
+        m.get("type") == "transport_update" and m.get("mode") == "p2p" for m in msgs_b
+    ), msgs_b
+    results.append("PASS: Private call switched to P2P")
+
+    send_msg(s1, {"type": "call_hangup", "target": "bob"})
+    time.sleep(0.2)
+    recv_all(s1, timeout=0.2)
+    recv_all(s2, timeout=0.2)
+
+    send_msg(s1, {"type": "call_invite", "target": "bob"})
+    time.sleep(0.2)
+    recv_all(s2, timeout=0.2)
+    send_msg(s2, {"type": "call_accept", "caller": "alice"})
+    time.sleep(0.3)
+    msgs_a = recv_all(s1, timeout=0.2)
+    ready_a = next((m for m in msgs_a if m.get("type") == "call_ready"), None)
+    assert ready_a, msgs_a
+    time.sleep(2.0)
+    msgs_a = recv_all(s1, timeout=0.2)
+    msgs_b = recv_all(s2, timeout=0.2)
+    assert any(
+        m.get("type") == "transport_update" and m.get("mode") == "relay" for m in msgs_a
+    ), msgs_a
+    assert any(
+        m.get("type") == "transport_update" and m.get("mode") == "relay" for m in msgs_b
+    ), msgs_b
+    results.append("PASS: Private call falls back to relay after negotiation timeout")
+
+    send_msg(s1, {"type": "call_hangup", "target": "bob"})
+    time.sleep(0.2)
+    recv_all(s1, timeout=0.2)
+    recv_all(s2, timeout=0.2)
+
+    # --- 测试3: 创建聊天室 ---
+    send_msg(s1, {"type": "room_create", "creator": "alice"})
+    time.sleep(0.3)
+    msgs = recv_all(s1)
+    create_resp = None
+    for m in msgs:
+        if m.get("success") is True and "room_id" in m.get("data", {}):
+            create_resp = m
+            break
+    assert create_resp is not None, f"Create room failed: {msgs}"
+    room_id = create_resp["data"]["room_id"]
+    results.append(f"PASS: Room created (id={room_id})")
+
+    # --- 测试4: 邀请 ---
+    send_msg(
+        s1,
+        {
+            "type": "room_invite",
+            "room_id": room_id,
+            "inviter": "alice",
+            "target": "bob",
+        },
+    )
+    time.sleep(0.3)
+
+    # Alice收到邀请成功响应
+    msgs_a = recv_all(s1)
+    invite_ok = any(m.get("success") is True for m in msgs_a)
+    assert invite_ok, f"Invite response failed: {msgs_a}"
+    results.append("PASS: Invite sent")
+
+    # Bob收到邀请通知
+    msgs_b = recv_all(s2)
+    invite_notify = any(m.get("type") == "room_invite_notify" for m in msgs_b)
+    assert invite_notify, f"Invite notify not received: {msgs_b}"
+    results.append("PASS: Bob received invite")
+
+    # --- 测试5: 加入房间 ---
+    send_msg(s2, {"type": "room_join", "room_id": room_id, "username": "bob"})
+    time.sleep(0.3)
+
+    msgs_b = recv_all(s2)
+    join_ok = any(m.get("success") is True for m in msgs_b)
+    assert join_ok, f"Join failed: {msgs_b}"
+    results.append("PASS: Bob joined room")
+
+    # 检查收到成员更新
+    member_update = any(m.get("type") == "room_member_update" for m in msgs_b)
+    results.append(
+        f"{'PASS' if member_update else 'INFO'}: Bob member update in join response"
+    )
+
+    # Alice也应该收到成员更新
+    msgs_a = recv_all(s1)
+    alice_update = any(m.get("type") == "room_member_update" for m in msgs_a)
+    results.append(
+        f"{'PASS' if alice_update else 'INFO'}: Alice member update after Bob joined"
+    )
+
+    # --- 测试6: 自适应下游音频 ---
+    send_msg(
+        s2,
+        json.loads(
+            encode_quality_report(
+                room_id,
+                "bob",
+                delay_ms=420,
+                jitter_ms=120,
+                packet_loss_percent=9.0,
+                sample_count=1,
+            )
+        ),
+    )
+    time.sleep(0.2)
+
+    adaptive_audio = bytes([64, 192]) * CANONICAL_AUDIO_FORMAT.chunk_size
+    send_msg(
+        s1,
+        json.loads(
+            encode_room_audio_chunk(
+                room_id,
+                "alice",
+                adaptive_audio,
+                seq=11,
+                timestamp_ms=789,
+                audio_format=CANONICAL_AUDIO_FORMAT.to_payload(),
+            )
+        ),
+    )
+    time.sleep(0.4)
+
+    msgs_b = recv_all(s2)
+    adaptive_chunks = [
+        m
+        for m in msgs_b
+        if m.get("type") == "room_audio_chunk" and m.get("sender") == "alice"
+    ]
+    assert adaptive_chunks, f"Adaptive room audio not received: {msgs_b}"
+    adaptive_format = adaptive_chunks[0].get("audio_format", {})
+    assert adaptive_format.get("sample_rate") == 8000, adaptive_chunks[0]
+    assert adaptive_format.get("channels") == 1, adaptive_chunks[0]
+    assert adaptive_format.get("sample_width") == 1, adaptive_chunks[0]
+    assert adaptive_format.get("chunk_size") == 256, adaptive_chunks[0]
+    assert adaptive_chunks[0].get("profile") == "resilient", adaptive_chunks[0]
+    results.append("PASS: Adaptive downstream audio profile applied")
+
+    # --- 测试7: 离开房间 ---
+    send_msg(s2, {"type": "room_leave", "room_id": room_id, "username": "bob"})
+    time.sleep(0.3)
+    msgs_b = recv_all(s2)
+    leave_ok = any(m.get("success") is True for m in msgs_b)
+    assert leave_ok, f"Leave failed: {msgs_b}"
+    results.append("PASS: Bob left room")
+
+    # --- 测试8: 解散房间 ---
+    # 重新邀请并加入Bob
+    send_msg(
+        s1,
+        {
+            "type": "room_invite",
+            "room_id": room_id,
+            "inviter": "alice",
+            "target": "bob",
+        },
+    )
+    time.sleep(0.2)
+    recv_all(s1)
+    recv_all(s2)
+
+    send_msg(s2, {"type": "room_join", "room_id": room_id, "username": "bob"})
+    time.sleep(0.2)
+    recv_all(s2)
+    recv_all(s1)
+
+    send_msg(s1, {"type": "room_dismiss", "room_id": room_id, "creator": "alice"})
+    time.sleep(0.3)
+
+    msgs_b = recv_all(s2)
+    dismissed = any(m.get("type") == "room_dismissed_notify" for m in msgs_b)
+    assert dismissed, f"Dismiss notify not received: {msgs_b}"
+    results.append("PASS: Room dismissed, Bob notified")
+
+    # 清理
+    server.stop()
+    s1.close()
+    s2.close()
+    udp_a.close()
+    udp_b.close()
+
+    print("\n" + "=" * 50)
+    print("Test Results:")
+    print("=" * 50)
+    for r in results:
+        print(f"  {r}")
+    print("=" * 50)
+    print(f"All {len(results)} tests completed!")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
